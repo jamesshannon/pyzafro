@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
@@ -82,6 +83,7 @@ class ZafroDevice:
         self.available = False
 
         self._subscribers: list[Callable[[ZafroDevice], None]] = []
+        self._raw_subscribers: list[Callable[[int, dict[str, Any]], None]] = []
         self._build_lock = asyncio.Lock()
         self._state_event = asyncio.Event()
         self._base_info_event = asyncio.Event()
@@ -101,6 +103,22 @@ class ZafroDevice:
         def _unsubscribe() -> None:
             with contextlib.suppress(ValueError):
                 self._subscribers.remove(callback)
+
+        return _unsubscribe
+
+    def subscribe_raw(
+        self, callback: Callable[[int, dict[str, Any]], None]
+    ) -> Callable[[], None]:
+        """Register a callback for undecoded inbound frames.
+
+        Intended for diagnostics: it sees the wire keys, including any this library does
+        not model yet, which is how an unsupported product gets characterised.
+        """
+        self._raw_subscribers.append(callback)
+
+        def _unsubscribe() -> None:
+            with contextlib.suppress(ValueError):
+                self._raw_subscribers.remove(callback)
 
         return _unsubscribe
 
@@ -248,6 +266,21 @@ class ZafroDevice:
                 f"{self.name} {field} must be between {low} and {high}"
             )
 
+    async def async_send_raw(self, state: dict[str, Any]) -> None:
+        """Publish a control frame using wire field names, bypassing validation.
+
+        An escape hatch for characterising an unsupported product, whose
+        capabilities are by definition unknown, and for testing a field this library
+        refuses. Nothing is applied optimistically — whatever the device reports back
+        is the only truth.
+
+        Not for normal use. Prefer the typed setters.
+        """
+        _LOGGER.warning("Sending unvalidated state to %s: %s", self.name, state)
+        await self._transport.publish(
+            self.vendor, self.sn, {"cmd": CMD_CONTROL, "data": {"state": state}}
+        )
+
     async def _async_command(self, **fields: Any) -> None:
         """Publish a control frame and optimistically apply what we sent.
 
@@ -319,6 +352,12 @@ class ZafroDevice:
 
     def handle_frame(self, cmd: int, result: dict[str, Any]) -> None:
         """Route an inbound frame. Called by the transport."""
+        for raw_callback in list(self._raw_subscribers):
+            try:
+                raw_callback(cmd, result)
+            except Exception:
+                _LOGGER.exception("Raw subscriber for %s raised", self.sn)
+
         if cmd == CMD_BASE_INFO:
             self.base_info = parse_base_info(result)
             self._base_info_event.set()
@@ -356,14 +395,27 @@ class ZafroDevice:
 
     # --- diagnostics -----------------------------------------------------------------
 
+    @property
+    def anon_id(self) -> str:
+        """A stable pseudonym for this device, safe to publish.
+
+        Distinguishes devices within one report without revealing the serial.
+        """
+        return hashlib.sha256(self.sn.encode()).hexdigest()[:8]
+
     def diagnostics(self) -> dict[str, Any]:
-        """Return a redacted dump, for bug reports about unsupported models."""
+        """Return a redacted dump, for bug reports about unsupported models.
+
+        Removes the serial, MAC, and every user-chosen name — device names and room
+        names are often personal.
+        """
         redacted = {
             key: value
             for key, value in self._raw.items()
-            if key not in {"sn", "mac", "name"}
+            if key not in {"sn", "mac", "name", "room", "additional", "data"}
         }
         return {
+            "anon_id": self.anon_id,
             "device_list_entry": redacted,
             "base_info": _asdict_or_none(self.base_info, drop={"ssid"}),
             "state": _asdict_or_none(self.state),

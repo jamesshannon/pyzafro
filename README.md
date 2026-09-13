@@ -80,14 +80,56 @@ Values are not normalised to Celsius; convert at the edge if you need to.
 **Fan speed `0` is not off.** It is the silent speed sleep mode selects, with the unit
 still running.
 
+## The diagnostic tool
+
+Installing the package also installs `pyzafro-diagnose`, which is how an unsupported
+product gets characterised and how an ambiguous field gets pinned down. It needs nothing
+but the package and your account.
+
+```bash
+pyzafro-diagnose report -e you@example.com -o zafro-report.json
+```
+
+Logs in, baselines every device, records for two minutes while you exercise the unit from
+the app, and writes a report. It names any wire field the library does not model — which
+is exactly what a new product needs someone to notice — and tells you whether your model
+is in the capability table.
+
+The report contains **no serial, MAC, wifi SSID, device name, or room name**. Devices are
+identified by a hash of the serial so several can be told apart. Attach it to an issue.
+
+```bash
+pyzafro-diagnose watch -e you@example.com
+```
+
+Tails decoded changes live, showing what changed and whether the device or a command
+caused it:
+
+```
+   12.4s  a3f91c02  push      device    ambient_humidity 88 -> 87
+   19.8s  a3f91c02  push      commanded swing_horizontal False -> True
+   20.9s  a3f91c02  push      device    fan_speed 4 -> 1; target_temperature 65 -> 76
+```
+
+```bash
+pyzafro-diagnose probe -e you@example.com --raw oscset1=true --observe 20
+```
+
+Sends one change and traces everything that follows, then reports the net change and any
+field the device acknowledged that you did not ask for. `--raw` bypasses validation, so it
+works on a product whose capabilities are unknown, or on a field the library refuses.
+
+The tool cannot see the hardware. For a physically visible question — which way a louvre
+moves, whether the fan really stops — it makes the causal link unambiguous and leaves the
+observation to you.
+
 ## Unsupported models
 
 Capabilities live in `capabilities.py`, keyed by model string. An unknown model still
 works — it falls back to a minimal set covering power, mode, setpoint and ambient
 readings — and logs the model at `INFO`.
 
-To get a model properly supported, open an issue with the output of
-`client.diagnostics()`, which is redacted and safe to paste.
+To get a model properly supported, open an issue with a `pyzafro-diagnose report`.
 
 ## Development
 
