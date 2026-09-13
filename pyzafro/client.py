@@ -113,6 +113,14 @@ class ZafroClient:
         """Block until the broker connection is established."""
         await self._mqtt.wait_connected(timeout)
 
+    def close(self) -> None:
+        """Release scheduled work. The listener task is the caller's to cancel.
+
+        The aiohttp session is borrowed, so it is deliberately left open.
+        """
+        for device in self._devices.values():
+            device.close()
+
     def diagnostics(self) -> dict[str, Any]:
         """Redacted dump of every device, for bug reports."""
         return {

@@ -325,6 +325,17 @@ class ZafroDevice:
         self._notify()
         self._arm_resync()
 
+    def close(self) -> None:
+        """Cancel anything scheduled. Call when the client is being torn down.
+
+        Only the resync timer is outstanding; without this it survives for
+        RESYNC_DELAY after shutdown, which a consumer that audits pending callbacks
+        will rightly complain about.
+        """
+        if self._resync_handle is not None:
+            self._resync_handle.cancel()
+            self._resync_handle = None
+
     def _arm_resync(self) -> None:
         if self._resync_handle is not None:
             self._resync_handle.cancel()
