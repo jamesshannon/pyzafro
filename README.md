@@ -51,7 +51,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-## Things worth knowing
+## Behaviour
 
 **Pick a unique `client_id` and keep it.** The phone app connects as `app_{user_id}`. If
 you reuse that, the broker evicts whichever client connected first and the app and your
@@ -91,9 +91,8 @@ pyzafro-diagnose report -e you@example.com -o zafro-report.json
 ```
 
 Logs in, baselines every device, records for two minutes while you exercise the unit from
-the app, and writes a report. It names any wire field the library does not model — which
-is exactly what a new product needs someone to notice — and tells you whether your model
-is in the capability table.
+the app, and writes a report. It names any wire field the library does not model, and
+tells you whether your model is in the capability table.
 
 The report contains **no serial, MAC, wifi SSID, device name, or room name**. Devices are
 identified by a hash of the serial so several can be told apart. Attach it to an issue.
