@@ -81,6 +81,21 @@ class ZafroMqtt:
         """Whether the broker connection is currently up."""
         return self._connected.is_set()
 
+    async def _async_tls_context(self) -> ssl.SSLContext:
+        """Return the TLS context, building a default one off the event loop.
+
+        `ssl.create_default_context()` reads the system trust store from disk, which
+        blocks. Calling it from a running loop stalls everything else on that loop;
+        Home Assistant detects it and asks the user to file a bug. Built once, in a
+        thread, and reused for every reconnect after that.
+
+        A caller that already has a context — anything running inside an application
+        with a shared, pre-warmed one — should pass it to the constructor instead.
+        """
+        if self._tls_context is None:
+            self._tls_context = await asyncio.to_thread(ssl.create_default_context)
+        return self._tls_context
+
     def _topics(self, sink: FrameSink) -> tuple[str, str]:
         return (
             TOPIC_REPLY.format(vendor=sink.vendor, sn=sink.sn),
@@ -164,7 +179,7 @@ class ZafroMqtt:
             identifier=self._client_id,
             transport="websockets",
             websocket_path=self._path,
-            tls_context=self._tls_context or ssl.create_default_context(),
+            tls_context=await self._async_tls_context(),
             logger=_LOGGER.getChild("aiomqtt"),
         )
         async with client:
