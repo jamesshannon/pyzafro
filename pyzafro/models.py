@@ -120,8 +120,10 @@ _WIRE_TO_FIELD: Final[dict[str, str]] = {
     "rh": "ambient_humidity",
     "windlevel": "fan_speed",
     "tempunit": "temperature_unit",
-    "oscset1": "swing_horizontal",
-    "oscset2": "swing_vertical",
+    # Which osc field drives which axis was a guess until someone watched the louvres:
+    # oscset1 is the up-and-down one.
+    "oscset1": "swing_vertical",
+    "oscset2": "swing_horizontal",
     "sleep": "sleep",
     "eco": "eco",
     "muteon": "mute",

@@ -102,6 +102,22 @@ def test_a_bad_value_does_not_cost_the_rest_of_the_frame():
     assert parsed.unknown == {"brandnew": "x"}
 
 
+def test_the_swing_axes_are_not_transposed():
+    """oscset1 is vertical, oscset2 horizontal. Shipped the other way round once.
+
+    Nothing in the protocol names the axes, so this is only knowable by watching the
+    louvres, and nothing downstream can tell it is wrong. Pinned in both directions.
+    """
+    state = DeviceState().merged(
+        parse_state({**FULL_STATE, "oscset1": True, "oscset2": False}).updates
+    )
+    assert state.swing_vertical is True
+    assert state.swing_horizontal is False
+
+    assert build_command({"swing_vertical": True}) == {"oscset1": True}
+    assert build_command({"swing_horizontal": True}) == {"oscset2": True}
+
+
 def test_build_command_uses_wire_names():
     assert build_command({"power": False}) == {"poweron": False}
     assert build_command({"mode": Mode.DRY, "target_humidity": 45}) == {
