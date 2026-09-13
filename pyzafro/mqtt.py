@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 import aiomqtt
 
 from .const import (
+    OFFLINE_GRACE,
     RECONNECT_MAX_DELAY,
     RECONNECT_MIN_DELAY,
     TOPIC_LWT,
@@ -75,6 +76,7 @@ class ZafroMqtt:
         self._client: aiomqtt.Client | None = None
         self._sinks: dict[str, FrameSink] = {}
         self._connected = asyncio.Event()
+        self._offline_handle: asyncio.TimerHandle | None = None
 
     @property
     def connected(self) -> bool:
@@ -152,16 +154,15 @@ class ZafroMqtt:
             try:
                 await self._run_once()
             except (asyncio.CancelledError, ZafroAuthError):
+                # Neither is retried, so there is nothing to wait out.
+                self._handle_disconnect(may_return=False)
                 raise
             except aiomqtt.MqttError as err:
                 _LOGGER.debug("MQTT connection lost: %s", err)
+                self._handle_disconnect(may_return=True)
             except Exception:
                 _LOGGER.exception("Unexpected MQTT failure")
-            finally:
-                self._client = None
-                if self._connected.is_set():
-                    self._connected.clear()
-                    self._mark_all_offline()
+                self._handle_disconnect(may_return=True)
 
             jittered = delay * (0.8 + random.random() * 0.4)  # noqa: S311
             _LOGGER.debug("Reconnecting to MQTT in %.1fs", jittered)
@@ -186,6 +187,7 @@ class ZafroMqtt:
             self._client = client
             for topic in self._sinks:
                 await client.subscribe(topic)
+            self._cancel_offline()
             self._connected.set()
             _LOGGER.debug(
                 "MQTT connected as %s, subscribed to %d topics",
@@ -223,9 +225,41 @@ class ZafroMqtt:
             result = frame.get("result")
             sink.handle_frame(cmd, result if isinstance(result, dict) else {})
 
+    def _handle_disconnect(self, *, may_return: bool) -> None:
+        """Tear down the dead connection, deciding when devices become unavailable.
+
+        A retryable drop usually resolves in a second or two, so the availability
+        change waits `OFFLINE_GRACE` and is cancelled outright if the reconnect beats
+        it. Without that, every routine websocket drop flaps the consumer's whole
+        device set — visible, alarming, and over before anyone can read it.
+        """
+        self._client = None
+        if not self._connected.is_set():
+            # Never got as far as CONNACK, so nothing was reported reachable and
+            # any timer from the drop that started this retry loop still stands.
+            return
+        self._connected.clear()
+        if not may_return:
+            self._mark_all_offline()
+            return
+        self._offline_handle = asyncio.get_running_loop().call_later(
+            OFFLINE_GRACE, self._mark_all_offline
+        )
+
+    def _cancel_offline(self) -> None:
+        """Call off a pending availability drop, because the connection came back."""
+        if self._offline_handle is not None:
+            self._offline_handle.cancel()
+            self._offline_handle = None
+
     def _mark_all_offline(self) -> None:
+        self._offline_handle = None
         for sink in set(self._sinks.values()):
             sink.handle_presence(online=False)
+
+    def close(self) -> None:
+        """Drop scheduled work. The listener task is the caller's to cancel."""
+        self._cancel_offline()
 
     async def publish(self, vendor: str, sn: str, payload: dict[str, Any]) -> None:
         """Publish a command envelope to a device's request topic."""

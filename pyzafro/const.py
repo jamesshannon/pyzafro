@@ -57,3 +57,10 @@ RESYNC_DELAY: Final = 5.0
 
 RECONNECT_MIN_DELAY: Final = 1.0
 RECONNECT_MAX_DELAY: Final = 300.0
+
+#: How long the transport may be down before devices are reported unavailable. A cloud
+#: broker drops a websocket every so often and the reconnect takes a second or two; the
+#: device is reachable either side of it, so announcing an outage for that gap is noise
+#: the consumer then has to filter. An LWT saying a device is gone is not deferred —
+#: that is the device speaking, not the socket.
+OFFLINE_GRACE: Final = 60.0

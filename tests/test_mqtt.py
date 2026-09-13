@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import ssl
 import threading
 from typing import TYPE_CHECKING, Any
 
+from pyzafro import mqtt as mqtt_module
 from pyzafro.mqtt import ZafroMqtt
 
 if TYPE_CHECKING:
@@ -54,3 +56,93 @@ async def test_supplied_tls_context_is_used_as_is() -> None:
     supplied = ssl.create_default_context()
     transport = _mqtt(tls_context=supplied)
     assert await transport._async_tls_context() is supplied
+
+
+class FakeSink:
+    """Records presence changes instead of being a device."""
+
+    vendor = "I4SEASON"
+    sn = "SN-A"
+
+    def __init__(self) -> None:
+        self.presence: list[bool] = []
+
+    def handle_frame(self, cmd: int, result: dict[str, Any]) -> None: ...
+
+    def handle_presence(self, *, online: bool) -> None:
+        self.presence.append(online)
+
+    def handle_reconnect(self) -> None: ...
+
+
+def _connected_transport() -> tuple[ZafroMqtt, FakeSink]:
+    """Build a transport that believes it is connected, with one device routed."""
+    transport = _mqtt()
+    sink = FakeSink()
+    transport._sinks["dev/reply"] = sink
+    transport._connected.set()
+    return transport, sink
+
+
+async def test_a_retryable_drop_does_not_report_devices_offline_at_once() -> None:
+    """The socket dying is not news until the reconnect has had its chance."""
+    transport, sink = _connected_transport()
+
+    transport._handle_disconnect(may_return=True)
+
+    assert sink.presence == []
+
+
+async def test_a_reconnect_inside_the_grace_is_never_seen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole point: a blip the consumer never has to know about.
+
+    The grace is shortened so the test can outlast it, which makes the assertion
+    meaningful — the timer had time to fire and did not, because reconnecting
+    cancelled it.
+    """
+    monkeypatch.setattr(mqtt_module, "OFFLINE_GRACE", 0.01)
+    transport, sink = _connected_transport()
+
+    transport._handle_disconnect(may_return=True)
+    transport._cancel_offline()
+    await asyncio.sleep(0.05)
+
+    assert sink.presence == []
+
+
+async def test_a_drop_that_outlasts_the_grace_reports_offline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reconnect that never comes has to surface eventually."""
+    monkeypatch.setattr(mqtt_module, "OFFLINE_GRACE", 0.01)
+    transport, sink = _connected_transport()
+
+    transport._handle_disconnect(may_return=True)
+    await asyncio.sleep(0.05)
+
+    assert sink.presence == [False]
+
+
+async def test_a_fatal_drop_reports_offline_immediately() -> None:
+    """Cancellation and bad credentials are not retried, so there is no wait."""
+    transport, sink = _connected_transport()
+
+    transport._handle_disconnect(may_return=False)
+
+    assert sink.presence == [False]
+
+
+async def test_closing_calls_off_a_pending_drop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A consumer that shuts down must not be called back a minute later."""
+    monkeypatch.setattr(mqtt_module, "OFFLINE_GRACE", 0.01)
+    transport, sink = _connected_transport()
+
+    transport._handle_disconnect(may_return=True)
+    transport.close()
+    await asyncio.sleep(0.05)
+
+    assert sink.presence == []

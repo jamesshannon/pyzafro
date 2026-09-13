@@ -140,6 +140,7 @@ class ZafroClient:
 
         The aiohttp session is borrowed, so it is deliberately left open.
         """
+        self._mqtt.close()
         for device in self._devices.values():
             device.close()
 
