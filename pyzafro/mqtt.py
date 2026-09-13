@@ -25,7 +25,7 @@ from .const import (
     WS_PATH,
     WS_PORT,
 )
-from .exceptions import ZafroConnectionError
+from .exceptions import ZafroAuthError, ZafroConnectionError
 
 if TYPE_CHECKING:
     from .auth import Authenticator
@@ -89,13 +89,16 @@ class ZafroMqtt:
     async def listen(self) -> None:
         """Connect, subscribe, and dispatch forever, reconnecting as needed.
 
-        Cancellation propagates; every other failure is retried with backoff.
+        Cancellation and ZafroAuthError propagate; every other failure is retried
+        with backoff. Bad credentials are not transient, and retrying them forever
+        would hide a password change from the consumer instead of letting it
+        re-prompt.
         """
         delay = RECONNECT_MIN_DELAY
         while True:
             try:
                 await self._run_once()
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, ZafroAuthError):
                 raise
             except aiomqtt.MqttError as err:
                 _LOGGER.debug("MQTT connection lost: %s", err)

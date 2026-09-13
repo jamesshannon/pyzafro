@@ -38,8 +38,9 @@ def device() -> ZafroDevice:
 
 
 def test_diagnostics_leaks_nothing_identifying(device):
-    device.handle_frame(5, {"v": "I4SEASON", "p": "90038EAC0-12K-ZAZ",
-                            "ssid": "homewifi", "rssi": 44})
+    device.handle_frame(
+        5, {"v": "I4SEASON", "p": "90038EAC0-12K-ZAZ", "ssid": "homewifi", "rssi": 44}
+    )
     dump = json.dumps(device.diagnostics())
 
     for secret in SECRETS:
