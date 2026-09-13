@@ -162,8 +162,17 @@ class ZafroMqtt:
         while True:
             try:
                 await self._run_once()
-            except (asyncio.CancelledError, ZafroAuthError):
-                # Neither is retried, so there is nothing to wait out.
+            except asyncio.CancelledError:
+                # The consumer is tearing this down, so its devices are going away
+                # with it. Reporting an outage on the way out is not information: it
+                # is the last thing written to whatever history the consumer keeps,
+                # which then reads as a unit that went unreachable rather than a
+                # Home Assistant that was asked to stop.
+                self._handle_shutdown()
+                raise
+            except ZafroAuthError:
+                # Not retried, so there is nothing to wait out, and the devices really
+                # are out of reach until the consumer re-authenticates.
                 self._handle_disconnect(may_return=False)
                 raise
             except (aiomqtt.MqttError, _UnresponsiveError) as err:
@@ -297,6 +306,17 @@ class ZafroMqtt:
         self._offline_handle = asyncio.get_running_loop().call_later(
             OFFLINE_GRACE, self._mark_all_offline
         )
+
+    def _handle_shutdown(self) -> None:
+        """Drop the connection without reporting on it.
+
+        Availability stops being ours to describe the moment the listener is
+        cancelled. A pending drop is called off too, so a timer armed just before
+        shutdown cannot fire into a consumer that has already let go.
+        """
+        self._client = None
+        self._cancel_offline()
+        self._connected.clear()
 
     def _cancel_offline(self) -> None:
         """Call off a pending availability drop, because the connection came back."""

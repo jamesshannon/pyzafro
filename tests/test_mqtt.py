@@ -125,12 +125,60 @@ async def test_a_drop_that_outlasts_the_grace_reports_offline(
 
 
 async def test_a_fatal_drop_reports_offline_immediately() -> None:
-    """Cancellation and bad credentials are not retried, so there is no wait."""
+    """Bad credentials are not retried, so there is nothing to wait out."""
     transport, sink = _connected_transport()
 
     transport._handle_disconnect(may_return=False)
 
     assert sink.presence == [False]
+
+
+async def test_shutdown_says_nothing_about_availability() -> None:
+    """Being cancelled is news about the consumer, not about the devices.
+
+    Home Assistant cancels background tasks on the way down while the recorder is
+    still writing, so an outage announced here becomes the last thing its logbook
+    has to say about every entity — read after the restart as a unit that went
+    unreachable, next to a unit that is plainly fine.
+    """
+    transport, sink = _connected_transport()
+
+    transport._handle_shutdown()
+
+    assert sink.presence == []
+    assert not transport.connected
+
+
+async def test_cancelling_the_listener_reports_no_outage() -> None:
+    """The path that actually runs at shutdown, not just the handler behind it."""
+    transport, sink = _connected_transport()
+
+    async def _hold() -> None:
+        transport._connected.set()
+        await asyncio.Event().wait()
+
+    transport._run_once = _hold  # type: ignore[method-assign]
+    listener = asyncio.create_task(transport.listen())
+    await asyncio.sleep(0)
+    listener.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await listener
+
+    assert sink.presence == []
+
+
+async def test_shutdown_calls_off_a_drop_armed_moments_earlier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timer from the drop that preceded the shutdown must not outlive it."""
+    monkeypatch.setattr(mqtt_module, "OFFLINE_GRACE", 0.01)
+    transport, sink = _connected_transport()
+
+    transport._handle_disconnect(may_return=True)
+    transport._handle_shutdown()
+    await asyncio.sleep(0.05)
+
+    assert sink.presence == []
 
 
 async def test_closing_calls_off_a_pending_drop(
