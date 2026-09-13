@@ -97,6 +97,7 @@ class ZafroDevice:
         self._unknown_keys: dict[str, Any] = {}
         self._rejected_keys: dict[str, Any] = {}
         self._drift: set[str] = set()
+        self._refined = False
 
     def __repr__(self) -> str:
         """Identify the device without leaking the full serial."""
@@ -402,6 +403,7 @@ class ZafroDevice:
         self._pending -= set(updates)
         if cmd == CMD_STATE:
             self._pending.clear()
+            self._refine_capabilities(updates)
             self._state_event.set()
         self.available = True
         self._check_capability_drift()
@@ -445,6 +447,41 @@ class ZafroDevice:
                 key,
                 value,
             )
+
+    def _refine_capabilities(self, updates: dict[str, Any]) -> None:
+        """Replace a guessed capability set with what the device actually reports.
+
+        Runs once, on the first full state snapshot. The model was not in the table,
+        so the fallback is a guess about an air conditioner; this is the first moment
+        there is evidence. A product from a class this library has never handled is
+        also the moment it becomes obvious, which is the only chance to stop a
+        consumer building a thermostat for a vacuum cleaner.
+        """
+        if self._refined or self.capabilities.known_model:
+            return
+        self._refined = True
+
+        self.capabilities = self.capabilities.refined(updates)
+        if self.capabilities.is_climate:
+            _LOGGER.info(
+                "%s (model %r) is not in the capability table; using what it reports: "
+                "%s. Please open an issue with a diagnostics dump.",
+                self.name,
+                self.model,
+                ", ".join(sorted(str(f) for f in self.capabilities.features))
+                or "no optional features",
+            )
+            return
+
+        _LOGGER.warning(
+            "%s (model %r) is not a supported product. It reports none of the fields "
+            "this library understands, so no controls will be created for it. Fields "
+            "seen: %s. Please open an issue with a diagnostics dump — supporting it "
+            "is a change to pyzafro alone.",
+            self.name,
+            self.model,
+            ", ".join(sorted(self._unknown_keys)) or "none",
+        )
 
     def _check_capability_drift(self) -> None:
         """Notice a device doing something its capability entry says it cannot.

@@ -15,9 +15,12 @@ import logging
 import re
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from .models import Mode
+
+if TYPE_CHECKING:
+    from collections.abc import Collection
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -65,6 +68,45 @@ class BinarySensorKey(StrEnum):
     REACHED_TARGET = "reached_target"
 
 
+#: DeviceState fields that prove a capability when a device reports them. Used only to
+#: narrow an unknown model down to what it demonstrably does — never to widen a model
+#: the table already describes.
+_FIELD_FEATURES: Final[dict[str, Feature]] = {
+    "fan_speed": Feature.FAN_SPEED,
+    "swing_horizontal": Feature.SWING_HORIZONTAL,
+    "swing_vertical": Feature.SWING_VERTICAL,
+    "sleep": Feature.SLEEP,
+    "eco": Feature.ECO,
+    "child_lock": Feature.CHILD_LOCK,
+    "display": Feature.DISPLAY,
+    "mute": Feature.MUTE,
+}
+
+_FIELD_SWITCHES: Final[dict[str, SwitchKey]] = {
+    "sleep": SwitchKey.SLEEP,
+    "eco": SwitchKey.ECO,
+    "child_lock": SwitchKey.CHILD_LOCK,
+    "display": SwitchKey.DISPLAY,
+    "mute": SwitchKey.MUTE,
+}
+
+_FIELD_BINARY_SENSORS: Final[dict[str, BinarySensorKey]] = {
+    "fault_code": BinarySensorKey.PROBLEM,
+    "reached_target": BinarySensorKey.REACHED_TARGET,
+}
+
+#: Sensors named after the state field they read. RSSI is absent because it comes from
+#: base info rather than from a state frame.
+_FIELD_SENSORS: Final[dict[str, SensorKey]] = {
+    "ambient_temperature": SensorKey.AMBIENT_TEMPERATURE,
+    "ambient_humidity": SensorKey.AMBIENT_HUMIDITY,
+    "work_time": SensorKey.WORK_TIME,
+    "filter_hours": SensorKey.FILTER_HOURS,
+    "water_level": SensorKey.WATER_LEVEL,
+    "fault_code": SensorKey.FAULT_CODE,
+}
+
+
 @dataclass(frozen=True, slots=True)
 class Capabilities:
     """What a device can do. Consumers branch on this, never on the model string."""
@@ -80,9 +122,62 @@ class Capabilities:
     #: False when the model was not in the table and defaults were used.
     known_model: bool = True
 
+    @property
+    def is_climate(self) -> bool:
+        """Whether this device is a thermostat-like thing at all.
+
+        False for a product that reports no mode, no setpoint and no ambient
+        temperature — a vacuum, say. A consumer must not build a climate entity for
+        one of those.
+        """
+        return bool(self.modes) or self.target_temperature_range is not None
+
     def has(self, feature: Feature) -> bool:
         """Return whether this device supports `feature`."""
         return feature in self.features
+
+    def refined(self, observed: Collection[str]) -> Capabilities:
+        """Narrow these capabilities to the DeviceState fields actually reported.
+
+        Only ever called for a model the table does not describe, and only ever
+        subtracts — the fallback is a guess, and a guess contradicted by evidence
+        should lose. Two things fall out of that:
+
+        A product from a class we have never handled reports none of the climate
+        fields, so it ends up claiming nothing, and the consumer builds no climate
+        entity rather than putting a thermostat dial on a vacuum.
+
+        An air conditioner we simply have not catalogued keeps everything it
+        demonstrated, which is usually *more* than the fallback claims: the fallback
+        offers no sleep or swing, but a unit reporting those fields gets them.
+        """
+        seen = set(observed)
+        return Capabilities(
+            modes=self.modes if "mode" in seen else frozenset(),
+            fan_speeds=self.fan_speeds if "fan_speed" in seen else (),
+            target_temperature_range=(
+                self.target_temperature_range if "target_temperature" in seen else None
+            ),
+            target_humidity_range=(
+                self.target_humidity_range if "target_humidity" in seen else None
+            ),
+            features=frozenset(
+                feature for field, feature in _FIELD_FEATURES.items() if field in seen
+            ),
+            sensors=frozenset(
+                {SensorKey.RSSI}
+                | {sensor for field, sensor in _FIELD_SENSORS.items() if field in seen}
+            ),
+            switches=frozenset(
+                switch for field, switch in _FIELD_SWITCHES.items() if field in seen
+            ),
+            binary_sensors=frozenset(
+                sensor
+                for field, sensor in _FIELD_BINARY_SENSORS.items()
+                if field in seen
+            ),
+            known_model=False,
+        )
 
 
 # --- model normalisation -------------------------------------------------------------

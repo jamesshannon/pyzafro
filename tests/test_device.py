@@ -8,6 +8,8 @@ from typing import Any
 
 import pytest
 
+from pyzafro import capabilities as caps_module
+from pyzafro.capabilities import Feature
 from pyzafro.device import ZafroDevice
 from pyzafro.exceptions import ZafroUnsupportedError
 from pyzafro.models import Mode
@@ -209,3 +211,52 @@ def test_a_new_base_info_field_is_reported_too(device, caplog):
 
     assert [r.getMessage() for r in caplog.records if "ipaddr" in r.getMessage()]
     assert dev.diagnostics()["anomalies"]["unknown_keys"] == {"ipaddr": "10.0.0.4"}
+
+
+def test_an_unsupported_product_gets_no_controls(device, caplog):
+    """A device from a class we have never handled must not become a thermostat."""
+    dev, _ = device
+    dev.model = "SMARTVAC-3000"
+    dev.capabilities = caps_module.resolve(dev.model)
+    assert dev.capabilities.is_climate  # the fallback guesses air conditioner
+
+    with caplog.at_level(logging.INFO, logger="pyzafro.device"):
+        dev.handle_frame(3, {"wrong": 0, "worktime": 4, "suction": 2, "dustbin": True})
+
+    assert not dev.capabilities.is_climate
+    assert dev.capabilities.modes == frozenset()
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "not a supported product" in message
+    # Name what it did report, so the issue writes itself.
+    assert "dustbin" in message
+    assert "suction" in message
+
+
+def test_an_uncatalogued_air_conditioner_still_works(device, caplog):
+    dev, _ = device
+    dev.model = "SOMEAC-9000"
+    dev.capabilities = caps_module.resolve(dev.model)
+
+    with caplog.at_level(logging.INFO, logger="pyzafro.device"):
+        dev.handle_frame(3, {**FULL_STATE, "sleep": False, "oscset2": True})
+
+    assert dev.capabilities.is_climate
+    assert dev.capabilities.has(Feature.SLEEP)
+    assert [r.levelno for r in caplog.records] == [logging.INFO]
+
+
+def test_capabilities_are_refined_once(device, caplog):
+    dev, _ = device
+    dev.model = "SOMEAC-9000"
+    dev.capabilities = caps_module.resolve(dev.model)
+    dev.handle_frame(3, {**FULL_STATE, "sleep": False})
+
+    with caplog.at_level(logging.INFO, logger="pyzafro.device"):
+        # A later snapshot arriving while the unit is off reports fewer fields. That
+        # must not retract a capability already demonstrated.
+        dev.handle_frame(3, {"poweron": False})
+
+    assert dev.capabilities.has(Feature.SLEEP)
+    assert caplog.records == []
