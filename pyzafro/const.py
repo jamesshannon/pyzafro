@@ -58,6 +58,13 @@ RESYNC_DELAY: Final = 5.0
 RECONNECT_MIN_DELAY: Final = 1.0
 RECONNECT_MAX_DELAY: Final = 300.0
 
+#: How long a connection must hold before the backoff is treated as spent. Without this
+#: the delay only ever grows, so a client that has been up for a day reconnects from a
+#: dropped socket five minutes later, having earned that penalty one routine drop at a
+#: time. Shorter than the 60s keepalive, because a connection that survives half of one
+#: is working; anything briefer looks like a flap and should still be backed off.
+RECONNECT_RESET_AFTER: Final = 30.0
+
 #: How long the transport may be down before devices are reported unavailable. A cloud
 #: broker drops a websocket every so often and the reconnect takes a second or two; the
 #: device is reachable either side of it, so announcing an outage for that gap is noise

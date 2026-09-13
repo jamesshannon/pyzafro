@@ -133,6 +133,50 @@ async def test_a_fatal_drop_reports_offline_immediately() -> None:
     assert sink.presence == [False]
 
 
+class _StopError(Exception):
+    """Breaks out of listen()'s infinite loop from inside the backoff sleep."""
+
+
+async def test_backoff_grows_while_flapping_and_clears_once_a_connection_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The delay used to only ever grow, across the whole life of the process.
+
+    A client up for hours had reached the 300s ceiling one routine drop at a time,
+    so a socket that dropped at 14:47 came back at 14:51 — with the broker healthy
+    and answering the whole while.
+    """
+    transport, _ = _connected_transport()
+    delays: list[float] = []
+
+    async def _record(seconds: float) -> None:
+        delays.append(seconds)
+        if len(delays) == 5:
+            raise _StopError
+
+    monkeypatch.setattr(mqtt_module.asyncio, "sleep", _record)
+
+    async def _drop() -> None:
+        # The fifth connection is the one that lasts; the rest die on arrival.
+        age = mqtt_module.RECONNECT_RESET_AFTER + 1 if len(delays) == 4 else 0.0
+        transport._connected_at = asyncio.get_running_loop().time() - age
+        raise mqtt_module.aiomqtt.MqttError("dropped")
+
+    transport._run_once = _drop  # type: ignore[method-assign]
+    try:
+        with pytest.raises(_StopError):
+            await transport.listen()
+    finally:
+        transport.close()
+
+    flapping = delays[:4]
+    assert flapping == sorted(flapping)
+    assert flapping[-1] > flapping[0]
+    # Back to the floor, not merely smaller than the ceiling it had climbed to.
+    assert delays[4] < flapping[-1]
+    assert delays[4] <= mqtt_module.RECONNECT_MIN_DELAY * 1.2
+
+
 async def test_shutdown_says_nothing_about_availability() -> None:
     """Being cancelled is news about the consumer, not about the devices.
 

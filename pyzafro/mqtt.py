@@ -19,6 +19,7 @@ from .const import (
     OFFLINE_GRACE,
     RECONNECT_MAX_DELAY,
     RECONNECT_MIN_DELAY,
+    RECONNECT_RESET_AFTER,
     TOPIC_LWT,
     TOPIC_REPLY,
     TOPIC_REQUEST,
@@ -86,6 +87,7 @@ class ZafroMqtt:
         self._connected = asyncio.Event()
         self._offline_handle: asyncio.TimerHandle | None = None
         self._unresponsive = asyncio.Event()
+        self._connected_at: float | None = None
 
     @property
     def connected(self) -> bool:
@@ -160,6 +162,7 @@ class ZafroMqtt:
         """
         delay = RECONNECT_MIN_DELAY
         while True:
+            self._connected_at = None
             try:
                 await self._run_once()
             except asyncio.CancelledError:
@@ -181,6 +184,9 @@ class ZafroMqtt:
             except Exception:
                 _LOGGER.exception("Unexpected MQTT failure")
                 self._handle_disconnect(may_return=True)
+
+            if self._held_long_enough():
+                delay = RECONNECT_MIN_DELAY
 
             jittered = delay * (0.8 + random.random() * 0.4)  # noqa: S311
             _LOGGER.debug("Reconnecting to MQTT in %.1fs", jittered)
@@ -206,6 +212,7 @@ class ZafroMqtt:
             for topic in self._sinks:
                 await client.subscribe(topic)
             self._cancel_offline()
+            self._connected_at = asyncio.get_running_loop().time()
             self._connected.set()
             _LOGGER.debug(
                 "MQTT connected as %s, subscribed to %d topics",
@@ -218,6 +225,18 @@ class ZafroMqtt:
                 sink.handle_reconnect()
 
             await self._dispatch_until_lost(client)
+
+    def _held_long_enough(self) -> bool:
+        """Whether the connection that just ended counts as having worked.
+
+        The backoff exists for an endpoint that is refusing to talk, not for one that
+        talks for hours and then drops a socket. A connection that held is evidence
+        the next attempt will succeed, so the next attempt should not be made to wait.
+        """
+        if self._connected_at is None:
+            return False
+        held = asyncio.get_running_loop().time() - self._connected_at
+        return held >= RECONNECT_RESET_AFTER
 
     async def _dispatch_until_lost(self, client: aiomqtt.Client) -> None:
         """Route inbound frames until the socket drops or is declared dead.
