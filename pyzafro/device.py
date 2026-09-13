@@ -326,8 +326,11 @@ class ZafroDevice:
         (eco moving the setpoint, sleep changing fan speed). Those arrive as normal
         device-originated pushes.
 
-        A rejected value produces no push at all, so anything still unconfirmed after
-        RESYNC_DELAY forces a full cmd:3 and the reply is taken as truth.
+        A rejected value is *assumed* to produce no push at all — no rejection has ever
+        been observed, so this is unverified. Anything still unconfirmed after
+        RESYNC_DELAY therefore forces a full cmd:3 and the reply is taken as truth. If
+        the device does in fact NAK somehow, the timer becomes redundant rather than
+        wrong.
         """
         self.state = self.state.merged(fields)
         self._pending |= set(fields)
