@@ -1,0 +1,391 @@
+"""A single device: state, capabilities, and the read/write paths.
+
+Writes are fire-and-forget with optimistic local application. See
+`_apply_optimistic` for why, and for how an unconfirmed write reconciles itself.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+from dataclasses import asdict
+from typing import TYPE_CHECKING, Any
+
+from . import capabilities as caps_module
+from .capabilities import Capabilities, Feature
+from .const import (
+    CMD_BASE_INFO,
+    CMD_CONTROL,
+    CMD_STATE,
+    CMD_STATE_PUSH,
+    REQUEST_TIMEOUT,
+    RESYNC_DELAY,
+)
+from .exceptions import ZafroTimeoutError, ZafroUnsupportedError
+from .models import (
+    READ_ONLY_FIELDS,
+    BaseInfo,
+    DeviceState,
+    Mode,
+    build_command,
+    parse_base_info,
+    parse_state,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from .mqtt import ZafroMqtt
+
+_LOGGER = logging.getLogger(__name__)
+
+#: Which setpoint field each mode uses. Confirmed against three real schedules read
+#: back from /job/list: cool carries templevel and never rhlevel, dry the reverse,
+#: fan neither.
+#:
+#: This is the only mode-dependence the captures actually establish. The app also
+#: omits sleep/eco from fan-mode schedules, but partial payloads are accepted
+#: generally, so that is evidence about what the app sends rather than what the
+#: device refuses — and it is not enforced here.
+_MODE_SETPOINT: dict[Mode, str | None] = {
+    Mode.COOL: "target_temperature",
+    Mode.DRY: "target_humidity",
+    Mode.FAN: None,
+    Mode.HEAT: "target_temperature",
+}
+
+
+class ZafroDevice:
+    """One air conditioner, dehumidifier, mistifier, or tower fan."""
+
+    def __init__(self, raw: dict[str, Any], transport: ZafroMqtt) -> None:
+        """Build from a flattened /device/list entry."""
+        self._raw = raw
+        self._transport = transport
+
+        self.sn: str = str(raw["sn"])
+        self.vendor: str = str(raw["vendor"])
+        # `type` is always an empty string on the wire; the model string is the real
+        # device-class signal, exactly as the app treats it.
+        self.model: str = str(raw.get("model") or "")
+        self.name: str = str(raw.get("name") or self.model or self.sn)
+        self.mac: str = str(raw.get("mac") or "")
+        self.firmware: str = str(raw.get("version") or "")
+        self.mcu_version: str = str(raw.get("mcu_version") or "")
+        self.room: str | None = raw.get("room")
+        self.room_id: int | None = raw.get("room_id")
+
+        self.capabilities: Capabilities = caps_module.resolve(self.model)
+        self.state = DeviceState()
+        self.base_info: BaseInfo | None = None
+        self.available = False
+
+        self._subscribers: list[Callable[[ZafroDevice], None]] = []
+        self._build_lock = asyncio.Lock()
+        self._state_event = asyncio.Event()
+        self._base_info_event = asyncio.Event()
+        self._pending: set[str] = set()
+        self._resync_handle: asyncio.TimerHandle | None = None
+
+    def __repr__(self) -> str:
+        """Identify the device without leaking the full serial."""
+        return f"<ZafroDevice {self.name!r} model={self.model} sn=…{self.sn[-4:]}>"
+
+    # --- subscription ----------------------------------------------------------------
+
+    def subscribe(self, callback: Callable[[ZafroDevice], None]) -> Callable[[], None]:
+        """Register a state-change callback. Returns an unsubscribe callable."""
+        self._subscribers.append(callback)
+
+        def _unsubscribe() -> None:
+            with contextlib.suppress(ValueError):
+                self._subscribers.remove(callback)
+
+        return _unsubscribe
+
+    def _notify(self) -> None:
+        for callback in list(self._subscribers):
+            try:
+                callback(self)
+            except Exception:
+                _LOGGER.exception("Subscriber for %s raised", self.sn)
+
+    # --- reads -----------------------------------------------------------------------
+
+    async def async_refresh(self) -> None:
+        """Request full state (cmd:3) and wait for the reply.
+
+        /device/list carries no state, so this is the only way to get a baseline.
+        Every subsequent cmd:4 delta is merged into it.
+        """
+        self._state_event.clear()
+        await self._transport.publish(self.vendor, self.sn, {"cmd": CMD_STATE})
+        await self._await_event(self._state_event, "state")
+
+    async def async_refresh_base_info(self) -> None:
+        """Request base info (cmd:5): model, firmware, wifi signal."""
+        self._base_info_event.clear()
+        await self._transport.publish(self.vendor, self.sn, {"cmd": CMD_BASE_INFO})
+        await self._await_event(self._base_info_event, "base info")
+
+    async def _await_event(self, event: asyncio.Event, what: str) -> None:
+        try:
+            await asyncio.wait_for(event.wait(), REQUEST_TIMEOUT)
+        except TimeoutError as err:
+            raise ZafroTimeoutError(
+                f"{self.name} did not return {what} within {REQUEST_TIMEOUT}s"
+            ) from err
+
+    # --- writes ----------------------------------------------------------------------
+
+    async def async_set_power(self, *, on: bool) -> None:
+        """Turn the device on or off."""
+        await self._async_command(power=on)
+
+    async def async_set_mode(self, mode: Mode) -> None:
+        """Change operating mode."""
+        if mode not in self.capabilities.modes:
+            raise ZafroUnsupportedError(
+                f"{self.name} does not support mode {mode.name}"
+            )
+        await self._async_command(mode=mode)
+
+    async def async_set_target_temperature(self, value: int) -> None:
+        """Set the temperature setpoint, in the device's own reported unit."""
+        self._require_setpoint("target_temperature")
+        self._require_range("target_temperature", value)
+        await self._async_command(target_temperature=int(value))
+
+    async def async_set_target_humidity(self, value: int) -> None:
+        """Set the humidity setpoint."""
+        self._require_setpoint("target_humidity")
+        self._require_range("target_humidity", value)
+        await self._async_command(target_humidity=int(value))
+
+    async def async_set_fan_speed(self, level: int) -> None:
+        """Set fan speed. 0 is the silent speed sleep mode uses, not off."""
+        self._require(Feature.FAN_SPEED)
+        if level not in self.capabilities.fan_speeds:
+            raise ZafroUnsupportedError(
+                f"{self.name} fan speed must be one of {self.capabilities.fan_speeds}"
+            )
+        await self._async_command(fan_speed=level)
+
+    async def async_set_swing(
+        self, *, horizontal: bool | None = None, vertical: bool | None = None
+    ) -> None:
+        """Set one or both swing axes."""
+        fields: dict[str, Any] = {}
+        if horizontal is not None:
+            self._require(Feature.SWING_HORIZONTAL)
+            fields["swing_horizontal"] = horizontal
+        if vertical is not None:
+            self._require(Feature.SWING_VERTICAL)
+            fields["swing_vertical"] = vertical
+        if fields:
+            await self._async_command(**fields)
+
+    async def async_set_sleep(self, *, on: bool) -> None:
+        """Toggle sleep mode.
+
+        The device reacts by setting mute and moving the fan speed; those arrive as a
+        separate device-originated push and are not assumed here.
+        """
+        self._require(Feature.SLEEP)
+        await self._async_command(sleep=on)
+
+    async def async_set_eco(self, *, on: bool) -> None:
+        """Toggle eco mode. The device moves the setpoint as a side effect."""
+        self._require(Feature.ECO)
+        await self._async_command(eco=on)
+
+    async def async_set_child_lock(self, *, on: bool) -> None:
+        """Toggle the child lock."""
+        self._require(Feature.CHILD_LOCK)
+        await self._async_command(child_lock=on)
+
+    async def async_set_display(self, *, on: bool) -> None:
+        """Toggle the front panel display."""
+        self._require(Feature.DISPLAY)
+        await self._async_command(display=on)
+
+    async def async_set_mute(self, *, on: bool) -> None:
+        """Toggle the beeper."""
+        self._require(Feature.MUTE)
+        await self._async_command(mute=on)
+
+    def _require(self, feature: Feature) -> None:
+        if not self.capabilities.has(feature):
+            raise ZafroUnsupportedError(f"{self.name} does not support {feature}")
+
+    def _require_setpoint(self, field: str) -> None:
+        """Reject a setpoint the current mode does not use.
+
+        Cool carries templevel and dry carries rhlevel; fan carries neither. Sending the
+        wrong one would be silently ignored by the device, which is worse than an error.
+        """
+        mode = self.state.mode
+        if mode is None:
+            return
+        expected = _MODE_SETPOINT.get(mode)
+        if expected != field:
+            raise ZafroUnsupportedError(
+                f"{self.name} does not use {field} in {mode.name.lower()} mode"
+            )
+
+    def _require_range(self, field: str, value: int) -> None:
+        bounds = (
+            self.capabilities.target_temperature_range
+            if field == "target_temperature"
+            else self.capabilities.target_humidity_range
+        )
+        if bounds is None:
+            raise ZafroUnsupportedError(f"{self.name} has no {field}")
+        low, high = bounds
+        if not low <= value <= high:
+            raise ZafroUnsupportedError(
+                f"{self.name} {field} must be between {low} and {high}"
+            )
+
+    async def _async_command(self, **fields: Any) -> None:
+        """Publish a control frame and optimistically apply what we sent.
+
+        The lock covers construction and the publish only — never a network wait. It
+        exists because the payload depends on the current mode, so two concurrent
+        setters are a read-modify-write hazard. Acks are not awaited: the
+        acknowledging frame arrives on the normal push path like any other.
+        """
+        async with self._build_lock:
+            payload = self._build_payload(fields)
+            await self._transport.publish(
+                self.vendor, self.sn, {"cmd": CMD_CONTROL, "data": {"state": payload}}
+            )
+        self._apply_optimistic(fields)
+
+    def _build_payload(self, fields: dict[str, Any]) -> dict[str, Any]:
+        """Build the wire `state` object.
+
+        Partial payloads are accepted — every schedule's end_command is a lone
+        {"poweron": false} — so only what changed is sent, with no padding.
+        """
+        for name in fields:
+            if name in READ_ONLY_FIELDS:
+                raise ZafroUnsupportedError(f"{name} is read-only")
+        payload = build_command(fields)
+        if not payload:
+            raise ZafroUnsupportedError("Nothing to send")
+        return payload
+
+    def _apply_optimistic(self, fields: dict[str, Any]) -> None:
+        """Assume the commanded fields took effect, then verify.
+
+        Only the fields actually sent are applied — never the device's side effects
+        (eco moving the setpoint, sleep changing fan speed). Those arrive as normal
+        device-originated pushes.
+
+        A rejected value produces no push at all, so anything still unconfirmed after
+        RESYNC_DELAY forces a full cmd:3 and the reply is taken as truth.
+        """
+        self.state = self.state.merged(fields)
+        self._pending |= set(fields)
+        self._notify()
+        self._arm_resync()
+
+    def _arm_resync(self) -> None:
+        if self._resync_handle is not None:
+            self._resync_handle.cancel()
+        loop = asyncio.get_running_loop()
+        self._resync_handle = loop.call_later(RESYNC_DELAY, self._resync_if_pending)
+
+    def _resync_if_pending(self) -> None:
+        self._resync_handle = None
+        if not self._pending:
+            return
+        _LOGGER.debug(
+            "%s did not confirm %s; resyncing", self.name, sorted(self._pending)
+        )
+        self._pending.clear()
+        task = asyncio.get_running_loop().create_task(self._safe_refresh())
+        task.add_done_callback(lambda _: None)
+
+    async def _safe_refresh(self) -> None:
+        try:
+            await self.async_refresh()
+        except Exception:
+            _LOGGER.debug("Resync of %s failed", self.name, exc_info=True)
+
+    # --- inbound ---------------------------------------------------------------------
+
+    def handle_frame(self, cmd: int, result: dict[str, Any]) -> None:
+        """Route an inbound frame. Called by the transport."""
+        if cmd == CMD_BASE_INFO:
+            self.base_info = parse_base_info(result)
+            self._base_info_event.set()
+            self._notify()
+            return
+
+        if cmd not in {CMD_STATE, CMD_STATE_PUSH}:
+            return
+
+        updates = parse_state(result)
+        if not updates:
+            return
+
+        # Always merge. cmd:4 frames are deltas; treating one as a snapshot would blank
+        # every field it omits.
+        self.state = self.state.merged(updates)
+        # Any report is authoritative, so stop waiting on the fields it covers.
+        self._pending -= set(updates)
+        if cmd == CMD_STATE:
+            self._pending.clear()
+            self._state_event.set()
+        self.available = True
+        self._notify()
+
+    def handle_presence(self, *, online: bool) -> None:
+        """Update availability from the LWT topic, or from a transport drop."""
+        if self.available != online:
+            self.available = online
+            self._notify()
+
+    def handle_reconnect(self) -> None:
+        """Re-baseline after a reconnect; missed deltas are never replayed."""
+        task = asyncio.get_running_loop().create_task(self._safe_refresh())
+        task.add_done_callback(lambda _: None)
+
+    # --- diagnostics -----------------------------------------------------------------
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Return a redacted dump, for bug reports about unsupported models."""
+        redacted = {
+            key: value
+            for key, value in self._raw.items()
+            if key not in {"sn", "mac", "name"}
+        }
+        return {
+            "device_list_entry": redacted,
+            "base_info": _asdict_or_none(self.base_info, drop={"ssid"}),
+            "state": _asdict_or_none(self.state),
+            "capabilities": {
+                "known_model": self.capabilities.known_model,
+                "normalised_model": caps_module.normalise_model(self.model),
+                "modes": sorted(m.name for m in self.capabilities.modes),
+                "fan_speeds": list(self.capabilities.fan_speeds),
+                "features": sorted(str(f) for f in self.capabilities.features),
+                "sensors": sorted(str(s) for s in self.capabilities.sensors),
+                "switches": sorted(str(s) for s in self.capabilities.switches),
+                "binary_sensors": sorted(
+                    str(s) for s in self.capabilities.binary_sensors
+                ),
+            },
+        }
+
+
+def _asdict_or_none(obj: Any, *, drop: set[str] | None = None) -> dict[str, Any] | None:
+    if obj is None:
+        return None
+    data = asdict(obj)
+    for key in drop or ():
+        data.pop(key, None)
+    return {k: (v.name if hasattr(v, "name") else v) for k, v in data.items()}

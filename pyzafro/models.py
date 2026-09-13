@@ -1,0 +1,281 @@
+"""Device state, base info, and wire translation.
+
+Wire field names appear in this module and nowhere else. Everything above it speaks in
+the names defined here.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from enum import IntEnum
+from typing import Any, Final
+
+
+class Mode(IntEnum):
+    """Operating mode.
+
+    Confirmed for air conditioners from ScheduleModel's label switch. On a tower fan the
+    same field is a wind profile in the same positional order (unconfirmed).
+    """
+
+    COOL = 1
+    DRY = 2
+    FAN = 3
+    HEAT = 4
+
+
+class TemperatureUnit(IntEnum):
+    """Unit the device reports temperatures in.
+
+    Values on the wire are expressed in this unit; they are not normalised. CELSIUS is
+    inferred from FAHRENHEIT being 1 and has never been observed.
+    """
+
+    CELSIUS = 0
+    FAHRENHEIT = 1
+
+
+class Origin(IntEnum):
+    """Who caused a reported change."""
+
+    #: Device-originated: ambient readings, and side effects it applied itself.
+    DEVICE = 0
+    #: Acknowledgement of a command, from this client or the phone app.
+    COMMANDED = 1
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceState:
+    """A device's reported state.
+
+    Every field is optional because cmd:4 frames are deltas. A field is None only until
+    the first frame that mentions it.
+    """
+
+    power: bool | None = None
+    mode: Mode | None = None
+    target_temperature: int | None = None
+    ambient_temperature: int | None = None
+    target_humidity: int | None = None
+    ambient_humidity: int | None = None
+    fan_speed: int | None = None
+    temperature_unit: TemperatureUnit | None = None
+    swing_horizontal: bool | None = None
+    swing_vertical: bool | None = None
+    sleep: bool | None = None
+    eco: bool | None = None
+    mute: bool | None = None
+    display: bool | None = None
+    child_lock: bool | None = None
+    water_level: int | None = None
+    filter_hours: int | None = None
+    work_time: int | None = None
+    reached_target: bool | None = None
+    fault_code: int | None = None
+    origin: Origin | None = None
+
+    def merged(self, updates: dict[str, Any]) -> DeviceState:
+        """Return a copy with `updates` applied.
+
+        Always merge. A cmd:4 carrying only {"rh": 88, "origin": 0} must not blank the
+        setpoint.
+        """
+        return replace(self, **updates)
+
+
+@dataclass(frozen=True, slots=True)
+class BaseInfo:
+    """Reply to cmd:5. Everything except ssid/rssi duplicates /device/list."""
+
+    vendor: str | None = None
+    model: str | None = None
+    firmware: str | None = None
+    mcu_version: str | None = None
+    mcu_type: str | None = None
+    ssid: str | None = None
+    rssi: int | None = None
+
+
+# --- wire translation ----------------------------------------------------------------
+
+#: wire key -> DeviceState field. The reverse of this drives command payloads.
+_WIRE_TO_FIELD: Final[dict[str, str]] = {
+    "poweron": "power",
+    "mode": "mode",
+    "templevel": "target_temperature",
+    "temperature": "ambient_temperature",
+    "rhlevel": "target_humidity",
+    "rh": "ambient_humidity",
+    "windlevel": "fan_speed",
+    "tempunit": "temperature_unit",
+    "oscset1": "swing_horizontal",
+    "oscset2": "swing_vertical",
+    "sleep": "sleep",
+    "eco": "eco",
+    "muteon": "mute",
+    "lighton": "display",
+    "childlockon": "child_lock",
+    "waterlevel": "water_level",
+    "filterthr": "filter_hours",
+    "worktime": "work_time",
+    "reachtarget": "reached_target",
+    "wrong": "fault_code",
+    "origin": "origin",
+}
+
+FIELD_TO_WIRE: Final[dict[str, str]] = {v: k for k, v in _WIRE_TO_FIELD.items()}
+
+#: Fields the device reports but never accepts as a command.
+READ_ONLY_FIELDS: Final = frozenset(
+    {
+        "ambient_temperature",
+        "ambient_humidity",
+        "temperature_unit",
+        "water_level",
+        "filter_hours",
+        "work_time",
+        "reached_target",
+        "fault_code",
+        "origin",
+    }
+)
+
+_BOOL_FIELDS: Final = frozenset(
+    {
+        "power",
+        "swing_horizontal",
+        "swing_vertical",
+        "sleep",
+        "eco",
+        "mute",
+        "display",
+        "child_lock",
+        "reached_target",
+    }
+)
+
+_INT_FIELDS: Final = frozenset(
+    {
+        "target_temperature",
+        "ambient_temperature",
+        "target_humidity",
+        "ambient_humidity",
+        "fan_speed",
+        "water_level",
+        "filter_hours",
+        "work_time",
+        "fault_code",
+    }
+)
+
+
+def _coerce_bool(value: Any) -> bool | None:
+    """Accept real booleans and the 0/1 ints the app's stored commands use."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return bool(value)
+    if isinstance(value, str):
+        return value.lower() in {"1", "true"}
+    return None
+
+
+def _coerce_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.lstrip("-").isdigit():
+        return int(value)
+    return None
+
+
+def parse_state(raw: dict[str, Any]) -> dict[str, Any]:
+    """Translate a wire `result` object into DeviceState field updates.
+
+    Unknown keys are ignored rather than raising: the field lists were recovered
+    per device class and a product we have not seen may report extras.
+    timeron/timeroff are objects ({"du", "ts"}) rather than the scalars the flat
+    field list implies, and are not modelled yet.
+    """
+    updates: dict[str, Any] = {}
+    for wire_key, value in raw.items():
+        field = _WIRE_TO_FIELD.get(wire_key)
+        if field is None or value is None:
+            continue
+        if field in _BOOL_FIELDS:
+            coerced: Any = _coerce_bool(value)
+        elif field in _INT_FIELDS:
+            coerced = _coerce_int(value)
+        elif field == "mode":
+            coerced = _as_enum(Mode, value)
+        elif field == "temperature_unit":
+            coerced = _as_enum(TemperatureUnit, value)
+        elif field == "origin":
+            coerced = _as_enum(Origin, value)
+        else:  # pragma: no cover - every field is covered above
+            continue
+        if coerced is not None:
+            updates[field] = coerced
+    return updates
+
+
+def _as_enum[T: IntEnum](enum_cls: type[T], value: Any) -> T | None:
+    """Convert to an enum member, tolerating values this library has not seen."""
+    number = _coerce_int(value)
+    if number is None:
+        return None
+    try:
+        return enum_cls(number)
+    except ValueError:
+        return None
+
+
+def build_command(fields: dict[str, Any]) -> dict[str, Any]:
+    """Translate DeviceState field names back into a wire `state` object."""
+    payload: dict[str, Any] = {}
+    for field, value in fields.items():
+        wire_key = FIELD_TO_WIRE.get(field)
+        if wire_key is None:
+            msg = f"unknown field {field!r}"
+            raise KeyError(msg)
+        payload[wire_key] = int(value) if isinstance(value, IntEnum) else value
+    return payload
+
+
+def parse_base_info(raw: dict[str, Any]) -> BaseInfo:
+    """Translate a cmd:5 reply."""
+    return BaseInfo(
+        vendor=raw.get("v"),
+        model=raw.get("p"),
+        firmware=raw.get("ver"),
+        mcu_version=raw.get("mcu_ver"),
+        mcu_type=raw.get("mp"),
+        ssid=raw.get("ssid"),
+        rssi=_coerce_int(raw.get("rssi")),
+    )
+
+
+def flatten_device_list(data: Any) -> list[dict[str, Any]]:
+    """Flatten /device/list, which groups by room rather than returning an array.
+
+    The room name and id are pushed down onto each device so the caller can build
+    areas without a second pass.
+    """
+    out: list[dict[str, Any]] = []
+    if not isinstance(data, list):
+        return out
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        if "devices" in entry:
+            for device in entry.get("devices") or []:
+                if not isinstance(device, dict):
+                    continue
+                merged = dict(device)
+                merged.setdefault("room", entry.get("room"))
+                merged.setdefault("room_id", entry.get("room_id"))
+                out.append(merged)
+        elif "sn" in entry:
+            out.append(dict(entry))
+    return out

@@ -1,0 +1,71 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pyzafro"
+version = "0.1.0"
+description = "Async client for the ZAFRO / i4Season air conditioner cloud API"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "James Shannon", email = "james@jamesshannon.com" }]
+keywords = ["zafro", "i4season", "air conditioner", "home automation", "homeassistant", "mqtt"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Home Automation",
+    "Typing :: Typed",
+]
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp>=3.9",
+    "aiomqtt>=2.0,<3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/jamesshannon/pyzafro"
+Issues = "https://github.com/jamesshannon/pyzafro/issues"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.11",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["pyzafro"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "D203",    # conflicts with D211
+    "D213",    # conflicts with D212
+    "COM812",  # conflicts with the formatter
+    "TRY003",  # long messages outside exception classes are fine here
+    "EM101",   # ditto
+    "EM102",   # ditto
+    "CPY001",  # no per-file copyright headers
+    "ANN401",  # JSON payloads are genuinely Any
+    "ASYNC109", # timeout parameters are part of the public API here
+    "PLR0913", # configuration constructors take many keyword arguments
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "PLR2004", "D1", "ANN", "SLF001", "ARG002"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
