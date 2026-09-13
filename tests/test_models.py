@@ -43,7 +43,7 @@ FULL_STATE = {
 
 
 def test_parses_a_full_state_frame():
-    state = DeviceState().merged(parse_state(FULL_STATE))
+    state = DeviceState().merged(parse_state(FULL_STATE).updates)
 
     assert state.power is True
     assert state.mode is Mode.COOL
@@ -58,9 +58,11 @@ def test_parses_a_full_state_frame():
 
 
 def test_cmd4_deltas_merge_rather_than_replace():
-    state = DeviceState().merged(parse_state(FULL_STATE))
+    state = DeviceState().merged(parse_state(FULL_STATE).updates)
     # A real ambient-only push. It must not blank the setpoint.
-    state = state.merged(parse_state({"rh": 88, "temperature": 79, "origin": 0}))
+    state = state.merged(
+        parse_state({"rh": 88, "temperature": 79, "origin": 0}).updates
+    )
 
     assert state.ambient_humidity == 88
     assert state.ambient_temperature == 79
@@ -68,20 +70,36 @@ def test_cmd4_deltas_merge_rather_than_replace():
     assert state.mode is Mode.COOL
 
 
-def test_unknown_keys_and_object_fields_are_ignored():
-    # timeron/timeroff are objects, not scalars, and are not modelled yet.
-    assert parse_state({"timeron": {"du": 0, "ts": 182}, "somethingnew": 5}) == {}
+def test_unknown_keys_are_reported_rather_than_silently_dropped():
+    # timeron is known-but-unmodelled, so it is not news. somethingnew is.
+    parsed = parse_state({"timeron": {"du": 0, "ts": 182}, "somethingnew": 5})
+
+    assert parsed.updates == {}
+    assert parsed.unknown == {"somethingnew": 5}
+    assert parsed.rejected == {}
 
 
 def test_booleans_arrive_as_ints_too():
     # poweron is a real bool in replies but an int inside stored schedule commands.
-    assert parse_state({"poweron": 1})["power"] is True
-    assert parse_state({"poweron": 0})["power"] is False
+    assert parse_state({"poweron": 1}).updates["power"] is True
+    assert parse_state({"poweron": 0}).updates["power"] is False
 
 
-def test_unrecognised_enum_values_do_not_raise():
-    # A device class we have not seen may use a mode integer outside 1-4.
-    assert parse_state({"mode": 99}) == {}
+def test_unrecognised_enum_values_do_not_raise_but_are_flagged():
+    # A device class we have not seen may use a mode integer outside 1-4. Dropping it
+    # leaves the previous mode showing, so it has to be reported.
+    parsed = parse_state({"mode": 99})
+
+    assert parsed.updates == {}
+    assert parsed.rejected == {"mode": 99}
+
+
+def test_a_bad_value_does_not_cost_the_rest_of_the_frame():
+    parsed = parse_state({"mode": 99, "temperature": 77, "brandnew": "x"})
+
+    assert parsed.updates == {"ambient_temperature": 77}
+    assert parsed.rejected == {"mode": 99}
+    assert parsed.unknown == {"brandnew": "x"}
 
 
 def test_build_command_uses_wire_names():

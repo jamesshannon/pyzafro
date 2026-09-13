@@ -25,10 +25,12 @@ from .const import (
 )
 from .exceptions import ZafroTimeoutError, ZafroUnsupportedError
 from .models import (
+    BASE_INFO_WIRE_KEYS,
     READ_ONLY_FIELDS,
     BaseInfo,
     DeviceState,
     Mode,
+    ParsedState,
     build_command,
     parse_base_info,
     parse_state,
@@ -89,6 +91,12 @@ class ZafroDevice:
         self._base_info_event = asyncio.Event()
         self._pending: set[str] = set()
         self._resync_handle: asyncio.TimerHandle | None = None
+        # Anomalies are logged once per key, not once per frame: pushes arrive every
+        # few seconds and a device on new firmware would otherwise flood the log.
+        # The samples are kept so diagnostics() can carry them into a bug report.
+        self._unknown_keys: dict[str, Any] = {}
+        self._rejected_keys: dict[str, Any] = {}
+        self._drift: set[str] = set()
 
     def __repr__(self) -> str:
         """Identify the device without leaking the full serial."""
@@ -370,6 +378,9 @@ class ZafroDevice:
                 _LOGGER.exception("Raw subscriber for %s raised", self.sn)
 
         if cmd == CMD_BASE_INFO:
+            self._log_unknown(
+                {k: v for k, v in result.items() if k not in BASE_INFO_WIRE_KEYS}
+            )
             self.base_info = parse_base_info(result)
             self._base_info_event.set()
             self._notify()
@@ -378,7 +389,9 @@ class ZafroDevice:
         if cmd not in {CMD_STATE, CMD_STATE_PUSH}:
             return
 
-        updates = parse_state(result)
+        parsed = parse_state(result)
+        self._log_anomalies(parsed)
+        updates = parsed.updates
         if not updates:
             return
 
@@ -391,7 +404,116 @@ class ZafroDevice:
             self._pending.clear()
             self._state_event.set()
         self.available = True
+        self._check_capability_drift()
         self._notify()
+
+    def _log_anomalies(self, parsed: ParsedState) -> None:
+        """Report anything in a frame this library could not use.
+
+        Two different problems, logged differently. An unknown key means the device
+        offers something we do not surface — nothing breaks, but a sensor is missing,
+        so INFO and an invitation to file it. A rejected value means a field we claim
+        to support arrived unreadable, so Home Assistant is showing a stale value and
+        does not know it; that is a WARNING.
+        """
+        self._log_unknown(parsed.unknown)
+
+        for key, value in parsed.rejected.items():
+            if key in self._rejected_keys:
+                continue
+            self._rejected_keys[key] = value
+            _LOGGER.warning(
+                "%s reported %r=%r, which this version of pyzafro cannot read. That "
+                "field will stay at its last known value. Please open an issue with "
+                "a diagnostics dump.",
+                self.name,
+                key,
+                value,
+            )
+
+    def _log_unknown(self, unknown: dict[str, Any]) -> None:
+        """Announce each never-before-seen wire key once."""
+        for key, value in unknown.items():
+            if key in self._unknown_keys:
+                continue
+            self._unknown_keys[key] = value
+            _LOGGER.info(
+                "%s reports %r, which this version of pyzafro does not model "
+                "(value: %r). Please open an issue with a diagnostics dump so it "
+                "can be supported.",
+                self.name,
+                key,
+                value,
+            )
+
+    def _check_capability_drift(self) -> None:
+        """Notice a device doing something its capability entry says it cannot.
+
+        This is how a half-supported product announces itself: the model matched a
+        family pattern, or fell back, and the guessed table is too narrow. It matters
+        because a consumer builds its UI from the capability table — Home Assistant
+        logs an error of its own when a device reports a fan speed that is not in the
+        list of speeds it was told to offer.
+        """
+        caps = self.capabilities
+        state = self.state
+
+        if (
+            state.mode is not None
+            and state.mode not in caps.modes
+            and self._note_drift(f"mode={state.mode.name}")
+        ):
+            _LOGGER.warning(
+                "%s is in %s mode, which is not in the capability table for model "
+                "%r. The table is incomplete; please open an issue.",
+                self.name,
+                state.mode.name.lower(),
+                self.model,
+            )
+
+        speed = state.fan_speed
+        if (
+            speed is not None
+            and caps.fan_speeds
+            and speed not in caps.fan_speeds
+            and self._note_drift(f"fan_speed={speed}")
+        ):
+            _LOGGER.warning(
+                "%s reports fan speed %d, outside the known speeds %s for model %r. "
+                "The table is incomplete; please open an issue.",
+                self.name,
+                speed,
+                caps.fan_speeds,
+                self.model,
+            )
+
+        for field, bounds in (
+            ("target_temperature", caps.target_temperature_range),
+            ("target_humidity", caps.target_humidity_range),
+        ):
+            value = getattr(state, field)
+            if value is None or bounds is None:
+                continue
+            low, high = bounds
+            if not low <= value <= high and self._note_drift(f"{field}={value}"):
+                _LOGGER.warning(
+                    "%s reports %s=%s, outside the assumed range %d-%d for model %r. "
+                    "The range is a guess; please open an issue so it can be "
+                    "corrected.",
+                    self.name,
+                    field,
+                    value,
+                    low,
+                    high,
+                    self.model,
+                )
+
+    def _note_drift(self, what: str) -> bool:
+        """Return True the first time `what` is seen, so each is logged once."""
+        if what in self._drift:
+            return False
+        self._drift.add(what)
+        return True
 
     def handle_presence(self, *, online: bool) -> None:
         """Update availability from the LWT topic, or from a transport drop."""
@@ -430,6 +552,13 @@ class ZafroDevice:
             "device_list_entry": redacted,
             "base_info": _asdict_or_none(self.base_info, drop={"ssid"}),
             "state": _asdict_or_none(self.state),
+            # The point of the whole anomaly-tracking exercise: whatever this device
+            # did that the library did not expect travels with the bug report.
+            "anomalies": {
+                "unknown_keys": dict(sorted(self._unknown_keys.items())),
+                "unreadable_keys": dict(sorted(self._rejected_keys.items())),
+                "outside_capabilities": sorted(self._drift),
+            },
             "capabilities": {
                 "known_model": self.capabilities.known_model,
                 "normalised_model": caps_module.normalise_model(self.model),

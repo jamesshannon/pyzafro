@@ -84,6 +84,18 @@ class DeviceState:
 
 
 @dataclass(frozen=True, slots=True)
+class ParsedState:
+    """The outcome of reading one wire frame."""
+
+    #: DeviceState field name -> value, ready to merge.
+    updates: dict[str, Any]
+    #: Wire keys this library has never seen, with the values reported.
+    unknown: dict[str, Any]
+    #: Wire keys it models, carrying values it could not read.
+    rejected: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
 class BaseInfo:
     """Reply to cmd:5. Everything except ssid/rssi duplicates /device/list."""
 
@@ -124,6 +136,25 @@ _WIRE_TO_FIELD: Final[dict[str, str]] = {
 }
 
 FIELD_TO_WIRE: Final[dict[str, str]] = {v: k for k, v in _WIRE_TO_FIELD.items()}
+
+#: Wire keys some device classes report that this library deliberately does not model
+#: yet. Listed so that "we know about this and skipped it" can be told apart from "we
+#: have never seen this key before", which is the signal worth logging.
+UNMODELLED_WIRE_KEYS: Final = frozenset(
+    {
+        "timeron",
+        "timeroff",
+        "oscset",
+        "oscangle",
+        "extra",
+        "auto",
+        "humilevel",
+        "lightmode",
+        "drymode",
+        "schedset",
+        "brightness",
+    }
+)
 
 #: Fields the device reports but never accepts as a command.
 READ_ONLY_FIELDS: Final = frozenset(
@@ -190,34 +221,51 @@ def _coerce_int(value: Any) -> int | None:
     return None
 
 
-def parse_state(raw: dict[str, Any]) -> dict[str, Any]:
+def _coerce_field(field: str, value: Any) -> Any:
+    """Read one wire value into its modelled type, or None if it cannot be read."""
+    if field in _BOOL_FIELDS:
+        return _coerce_bool(value)
+    if field in _INT_FIELDS:
+        return _coerce_int(value)
+    if field == "mode":
+        return _as_enum(Mode, value)
+    if field == "temperature_unit":
+        return _as_enum(TemperatureUnit, value)
+    if field == "origin":
+        return _as_enum(Origin, value)
+    return None  # pragma: no cover - every field is covered above
+
+
+def parse_state(raw: dict[str, Any]) -> ParsedState:
     """Translate a wire `result` object into DeviceState field updates.
 
-    Unknown keys are ignored rather than raising: the field lists were recovered
-    per device class and a product we have not seen may report extras.
-    timeron/timeroff are objects ({"du", "ts"}) rather than the scalars the flat
-    field list implies, and are not modelled yet.
+    Nothing raises. A frame carrying something unexpected still yields every field
+    that *was* understood, because a device reporting one new key must not stop
+    reporting its temperature. What could not be used is returned alongside so the
+    caller can say so out loud — see `ZafroDevice._log_anomalies`.
     """
     updates: dict[str, Any] = {}
+    unknown: dict[str, Any] = {}
+    rejected: dict[str, Any] = {}
+
     for wire_key, value in raw.items():
         field = _WIRE_TO_FIELD.get(wire_key)
-        if field is None or value is None:
+        if field is None:
+            if wire_key not in UNMODELLED_WIRE_KEYS:
+                unknown[wire_key] = value
             continue
-        if field in _BOOL_FIELDS:
-            coerced: Any = _coerce_bool(value)
-        elif field in _INT_FIELDS:
-            coerced = _coerce_int(value)
-        elif field == "mode":
-            coerced = _as_enum(Mode, value)
-        elif field == "temperature_unit":
-            coerced = _as_enum(TemperatureUnit, value)
-        elif field == "origin":
-            coerced = _as_enum(Origin, value)
-        else:  # pragma: no cover - every field is covered above
+        if value is None:
             continue
-        if coerced is not None:
+        coerced = _coerce_field(field, value)
+        if coerced is None:
+            # A key we claim to support, carrying a value we cannot read. Worse than
+            # an unknown key: the field keeps its previous value and Home Assistant
+            # shows something stale without knowing it.
+            rejected[wire_key] = value
+        else:
             updates[field] = coerced
-    return updates
+
+    return ParsedState(updates=updates, unknown=unknown, rejected=rejected)
 
 
 def _as_enum[T: IntEnum](enum_cls: type[T], value: Any) -> T | None:
@@ -241,6 +289,12 @@ def build_command(fields: dict[str, Any]) -> dict[str, Any]:
             raise KeyError(msg)
         payload[wire_key] = int(value) if isinstance(value, IntEnum) else value
     return payload
+
+
+#: Every key a cmd:5 reply is known to carry. `sn` is echoed back and ignored.
+BASE_INFO_WIRE_KEYS: Final = frozenset(
+    {"v", "p", "ver", "mcu_ver", "mp", "ssid", "rssi", "sn"}
+)
 
 
 def parse_base_info(raw: dict[str, Any]) -> BaseInfo:

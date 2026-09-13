@@ -19,7 +19,14 @@ from .exceptions import (
     ZafroTimeoutError,
     ZafroUnsupportedError,
 )
-from .models import BaseInfo, DeviceState, Mode, Origin, TemperatureUnit
+from .models import (
+    BaseInfo,
+    DeviceState,
+    Mode,
+    Origin,
+    ParsedState,
+    TemperatureUnit,
+)
 
 __all__ = [
     "BaseInfo",
@@ -29,6 +36,7 @@ __all__ = [
     "Feature",
     "Mode",
     "Origin",
+    "ParsedState",
     "SensorKey",
     "SwitchKey",
     "TemperatureUnit",

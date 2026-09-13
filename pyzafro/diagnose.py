@@ -38,7 +38,13 @@ from . import __version__
 from .client import ZafroClient
 from .const import CMD_BASE_INFO, CMD_PRESENCE, CMD_STATE, CMD_STATE_PUSH
 from .exceptions import ZafroError
-from .models import FIELD_TO_WIRE, DeviceState, Origin, parse_state
+from .models import (
+    FIELD_TO_WIRE,
+    UNMODELLED_WIRE_KEYS,
+    DeviceState,
+    Origin,
+    parse_state,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -49,24 +55,6 @@ _LOGGER = logging.getLogger(__name__)
 
 #: Wire keys this library models. Anything else a device reports is a discovery.
 KNOWN_WIRE_KEYS = frozenset(FIELD_TO_WIRE.values())
-
-#: Reported by some device classes but not modelled yet. Listed so a report can
-#: distinguish "we know about this and skipped it" from "we have never seen this".
-UNMODELLED_WIRE_KEYS = frozenset(
-    {
-        "timeron",
-        "timeroff",
-        "oscset",
-        "oscangle",
-        "extra",
-        "auto",
-        "humilevel",
-        "lightmode",
-        "drymode",
-        "schedset",
-        "brightness",
-    }
-)
 
 #: Caps on how much sample data a report keeps per field.
 MAX_UNKNOWN_SAMPLES = 10
@@ -135,7 +123,7 @@ class Recorder:
         for frame in self.frames:
             if frame["cmd"] not in {CMD_STATE, CMD_STATE_PUSH}:
                 continue
-            for field, value in parse_state(frame["result"]).items():
+            for field, value in parse_state(frame["result"]).updates.items():
                 plain = value.value if hasattr(value, "value") else value
                 values = seen.setdefault(field, [])
                 if plain not in values and len(values) < MAX_RANGE_SAMPLES:
@@ -343,7 +331,7 @@ async def _cmd_watch(args: argparse.Namespace) -> int:
     def make_handler(device: ZafroDevice) -> Any:
         def _on_frame(cmd: int, result: dict[str, Any]) -> None:
             before = previous.get(device.sn, DeviceState())
-            after = before.merged(parse_state(result))
+            after = before.merged(parse_state(result).updates)
             previous[device.sn] = after
             changes = _diff(before, after)
             who = _origin_name(result.get("origin"))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 import pytest
@@ -18,6 +19,18 @@ RAW = {
     "name": "Air Conditioner",
     "mac": "001cc2000000",
     "version": "1.0.29",
+}
+
+
+#: A real cmd:3 reply, trimmed to the fields these tests touch.
+FULL_STATE = {
+    "poweron": True,
+    "mode": 1,
+    "templevel": 67,
+    "temperature": 77,
+    "tempunit": 1,
+    "windlevel": 1,
+    "timeron": {"du": 0, "ts": 182},
 }
 
 
@@ -125,3 +138,74 @@ async def test_subscribers_see_pushes(device):
     unsubscribe()
     dev.handle_frame(4, {"temperature": 80})
     assert seen == [79]
+
+
+def test_an_unknown_key_is_logged_once_and_kept(device, caplog):
+    """A firmware update adding a field must be visible without flooding the log."""
+    dev, _ = device
+    with caplog.at_level(logging.INFO, logger="pyzafro.device"):
+        for _ in range(5):
+            dev.handle_frame(4, {"rh": 80, "ionizer": True})
+
+    messages = [r for r in caplog.records if "ionizer" in r.getMessage()]
+    assert len(messages) == 1
+    assert messages[0].levelno == logging.INFO
+    # The unexpected value travels with the bug report.
+    assert dev.diagnostics()["anomalies"]["unknown_keys"] == {"ionizer": True}
+
+
+def test_known_but_unmodelled_keys_stay_quiet(device, caplog):
+    """The timeron key is in every frame. Logging it would be pure noise."""
+    dev, _ = device
+    with caplog.at_level(logging.INFO, logger="pyzafro.device"):
+        dev.handle_frame(4, {"timeron": {"du": 0, "ts": 182}, "extra": False})
+
+    assert caplog.records == []
+    assert dev.diagnostics()["anomalies"]["unknown_keys"] == {}
+
+
+def test_an_unreadable_value_on_a_known_key_warns(device, caplog):
+    """Worse than an unknown key: the field silently keeps a stale value."""
+    dev, _ = device
+    dev.handle_frame(3, dict(FULL_STATE))
+    with caplog.at_level(logging.WARNING, logger="pyzafro.device"):
+        for _ in range(3):
+            dev.handle_frame(4, {"mode": 99})
+
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+    assert dev.state.mode is Mode.COOL
+    assert dev.diagnostics()["anomalies"]["unreadable_keys"] == {"mode": 99}
+
+
+def test_a_device_outside_its_capability_table_says_so(device, caplog):
+    """The half-supported product case: the guessed table is too narrow."""
+    dev, _ = device
+    with caplog.at_level(logging.WARNING, logger="pyzafro.device"):
+        dev.handle_frame(3, {**FULL_STATE, "windlevel": 7, "templevel": 95})
+
+    warnings = [r.getMessage() for r in caplog.records]
+    assert any("fan speed 7" in message for message in warnings)
+    assert any("target_temperature=95" in message for message in warnings)
+    assert dev.diagnostics()["anomalies"]["outside_capabilities"] == [
+        "fan_speed=7",
+        "target_temperature=95",
+    ]
+
+
+def test_capability_drift_is_logged_once_per_value(device, caplog):
+    dev, _ = device
+    with caplog.at_level(logging.WARNING, logger="pyzafro.device"):
+        for _ in range(4):
+            dev.handle_frame(3, {**FULL_STATE, "windlevel": 7})
+
+    assert len([r for r in caplog.records if "fan speed 7" in r.getMessage()]) == 1
+
+
+def test_a_new_base_info_field_is_reported_too(device, caplog):
+    """A server-side change can add keys to cmd:5 just as easily as to cmd:3."""
+    dev, _ = device
+    with caplog.at_level(logging.INFO, logger="pyzafro.device"):
+        dev.handle_frame(5, {"v": "I4SEASON", "p": "X", "ipaddr": "10.0.0.4"})
+
+    assert [r.getMessage() for r in caplog.records if "ipaddr" in r.getMessage()]
+    assert dev.diagnostics()["anomalies"]["unknown_keys"] == {"ipaddr": "10.0.0.4"}
