@@ -11,8 +11,10 @@ Built for [Home Assistant](https://www.home-assistant.io/), usable anywhere. `ai
 
 ## Install
 
+Not on PyPI yet.
+
 ```bash
-pip install pyzafro
+pip install git+https://github.com/jamesshannon/pyzafro
 ```
 
 ## Use

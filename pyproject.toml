@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyzafro"
-version = "0.1.2"
+dynamic = ["version"]
 description = "Async client for the ZAFRO / i4Season air conditioner cloud API"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "James Shannon", email = "james@jamesshannon.com" }]
 keywords = ["zafro", "i4season", "air conditioner", "home automation", "homeassistant", "mqtt"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.12",
@@ -39,6 +39,11 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.6",
 ]
+
+[tool.hatch.version]
+# Single source. Keeping a literal here as well let the two drift, and the stale one
+# was the one stamped into every diagnostic report.
+path = "pyzafro/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["pyzafro"]
