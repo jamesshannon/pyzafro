@@ -366,8 +366,20 @@ class ZafroDevice:
         task.add_done_callback(lambda _: None)
 
     async def _safe_refresh(self) -> None:
+        """Re-read state, treating no answer as evidence about the connection.
+
+        A device that is present and still says nothing to a cmd:3 is the earliest
+        sign available that the socket is half-open — the broker has hung up and the
+        client will not notice until its next keepalive, during which every command
+        published is lost. A device the last-will topic has already declared gone
+        explains its own silence, so it is not taken as evidence.
+        """
         try:
             await self.async_refresh()
+        except ZafroTimeoutError:
+            _LOGGER.debug("Resync of %s timed out", self.name)
+            if self.available:
+                self._transport.note_unresponsive(self.sn)
         except Exception:
             _LOGGER.debug("Resync of %s failed", self.name, exc_info=True)
 

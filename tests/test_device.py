@@ -41,12 +41,16 @@ class FakeTransport:
 
     def __init__(self) -> None:
         self.published: list[dict[str, Any]] = []
+        self.unresponsive: list[str] = []
 
     async def publish(self, vendor: str, sn: str, payload: dict[str, Any]) -> None:
         self.published.append(payload)
 
     def register(self, sink: Any) -> None:
         pass
+
+    def note_unresponsive(self, sn: str) -> None:
+        self.unresponsive.append(sn)
 
 
 @pytest.fixture
@@ -260,3 +264,35 @@ def test_capabilities_are_refined_once(device, caplog):
 
     assert dev.capabilities.has(Feature.SLEEP)
     assert caplog.records == []
+
+
+async def test_an_unanswered_resync_reports_the_connection_as_suspect(device):
+    """A present device that says nothing is the first sign of a half-open socket.
+
+    The broker can hang up without the client noticing until its next keepalive, and
+    every command published in that window is lost. This is the earliest evidence
+    available, so it is passed to the transport instead of being swallowed.
+    """
+    dev, transport = device
+    dev.handle_frame(3, FULL_STATE)  # marks it available
+    assert dev.available
+
+    monkeypatched = 0.01
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("pyzafro.device.REQUEST_TIMEOUT", monkeypatched)
+        await dev._safe_refresh()
+
+    assert transport.unresponsive == [dev.sn]
+
+
+async def test_a_device_already_known_gone_is_not_evidence(device):
+    """The last-will topic explained the silence; the socket is not implicated."""
+    dev, transport = device
+    dev.handle_frame(3, FULL_STATE)
+    dev.handle_presence(online=False)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("pyzafro.device.REQUEST_TIMEOUT", 0.01)
+        await dev._safe_refresh()
+
+    assert transport.unresponsive == []

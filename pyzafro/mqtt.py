@@ -35,6 +35,14 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 
+class _UnresponsiveError(Exception):
+    """The broker stopped answering, so the socket is treated as already dead.
+
+    Internal to this module. Raised in place of the `aiomqtt.MqttError` the same
+    situation would eventually produce on its own, so the reconnect path is shared.
+    """
+
+
 class FrameSink(Protocol):
     """The slice of ZafroDevice this module needs. Keeps the dependency one-way."""
 
@@ -77,6 +85,7 @@ class ZafroMqtt:
         self._sinks: dict[str, FrameSink] = {}
         self._connected = asyncio.Event()
         self._offline_handle: asyncio.TimerHandle | None = None
+        self._unresponsive = asyncio.Event()
 
     @property
     def connected(self) -> bool:
@@ -157,7 +166,7 @@ class ZafroMqtt:
                 # Neither is retried, so there is nothing to wait out.
                 self._handle_disconnect(may_return=False)
                 raise
-            except aiomqtt.MqttError as err:
+            except (aiomqtt.MqttError, _UnresponsiveError) as err:
                 _LOGGER.debug("MQTT connection lost: %s", err)
                 self._handle_disconnect(may_return=True)
             except Exception:
@@ -199,8 +208,51 @@ class ZafroMqtt:
             for sink in set(self._sinks.values()):
                 sink.handle_reconnect()
 
-            async for message in client.messages:
-                self._dispatch(str(message.topic), message.payload)
+            await self._dispatch_until_lost(client)
+
+    async def _dispatch_until_lost(self, client: aiomqtt.Client) -> None:
+        """Route inbound frames until the socket drops or is declared dead.
+
+        The iteration itself cannot notice a half-open socket — that is the whole
+        problem — so it is raced against `_unresponsive`, which a device sets when a
+        request it expected an answer to went unanswered.
+        """
+        self._unresponsive.clear()
+        pump = asyncio.create_task(self._pump(client))
+        declared = asyncio.create_task(self._unresponsive.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (pump, declared), return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            for task in (pump, declared):
+                task.cancel()
+        if pump in done:
+            # Re-raises whatever ended the iteration, usually an MqttError.
+            pump.result()
+            return
+        raise _UnresponsiveError("Broker stopped answering")
+
+    async def _pump(self, client: aiomqtt.Client) -> None:
+        async for message in client.messages:
+            self._dispatch(str(message.topic), message.payload)
+
+    def note_unresponsive(self, sn: str) -> None:
+        """Report that a device answered nothing, so the connection looks dead.
+
+        A websocket the broker has hung up on stays readable for up to a keepalive
+        interval, and a command published into it is simply lost. A request that timed
+        out is the earliest evidence available, so it is used to tear the connection
+        down rather than waiting for the ping to notice.
+
+        The caller only reports this for a device it still believes is present; a
+        device the last-will topic has already declared gone explains its own silence
+        and says nothing about the socket.
+        """
+        if not self._connected.is_set() or self._unresponsive.is_set():
+            return
+        _LOGGER.debug("%s went unanswered; reconnecting rather than waiting", sn)
+        self._unresponsive.set()
 
     def _dispatch(self, topic: str, payload: Any) -> None:
         sink = self._sinks.get(topic)

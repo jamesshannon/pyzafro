@@ -5,13 +5,12 @@ from __future__ import annotations
 import asyncio
 import ssl
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import Any
+
+import pytest
 
 from pyzafro import mqtt as mqtt_module
 from pyzafro.mqtt import ZafroMqtt
-
-if TYPE_CHECKING:
-    import pytest
 
 
 def _mqtt(**kwargs: Any) -> ZafroMqtt:
@@ -146,3 +145,52 @@ async def test_closing_calls_off_a_pending_drop(
     await asyncio.sleep(0.05)
 
     assert sink.presence == []
+
+
+async def test_an_unresponsive_report_ends_the_connection() -> None:
+    """The dispatch loop cannot see a half-open socket, so a device tells it."""
+    transport, _ = _connected_transport()
+
+    transport.note_unresponsive("SN-A")
+
+    assert transport._unresponsive.is_set()
+
+
+async def test_an_unresponsive_report_while_disconnected_is_ignored() -> None:
+    """A reconnect is already under way; nothing to tear down."""
+    transport, _ = _connected_transport()
+    transport._connected.clear()
+
+    transport.note_unresponsive("SN-A")
+
+    assert not transport._unresponsive.is_set()
+
+
+class SilentClient:
+    """An aiomqtt client whose socket is open but whose broker has gone away."""
+
+    @property
+    def messages(self) -> Any:
+        return self
+
+    def __aiter__(self) -> Any:
+        return self
+
+    async def __anext__(self) -> Any:
+        await asyncio.sleep(3600)
+        raise AssertionError  # pragma: no cover
+
+
+async def test_a_silent_socket_is_abandoned_rather_than_waited_out() -> None:
+    """Without this the loop blocks until the keepalive notices, a minute later."""
+    transport, _ = _connected_transport()
+    dispatch = asyncio.create_task(
+        transport._dispatch_until_lost(SilentClient())  # type: ignore[arg-type]
+    )
+    await asyncio.sleep(0)
+    transport.note_unresponsive("SN-A")
+
+    # Bounded so a regression fails here rather than hanging the suite, which is
+    # exactly what the old code did to the connection.
+    with pytest.raises(mqtt_module._UnresponsiveError):
+        await asyncio.wait_for(dispatch, timeout=1)
