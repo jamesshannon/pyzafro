@@ -66,7 +66,10 @@ class ZafroClient:
 
     @property
     def devices(self) -> list[ZafroDevice]:
-        """Devices discovered by the most recent enumeration."""
+        """Every device this client is currently tracking.
+
+        Grows with enumeration and shrinks only on `async_forget`.
+        """
         return list(self._devices.values())
 
     @property
@@ -82,24 +85,43 @@ class ZafroClient:
         await self._auth.async_get_token()
 
     async def async_get_devices(self) -> list[ZafroDevice]:
-        """Enumerate devices and register them with the transport.
+        """Enumerate the account, returning exactly what it reports right now.
 
-        Safe to call again later to pick up devices added in the app; existing
-        ZafroDevice objects are preserved so subscriptions survive.
+        Safe to call again later to pick up devices added in the app; a device already
+        known is returned as the same ZafroDevice object, so subscriptions survive.
+
+        A device that has stopped being reported is *not* forgotten — it is simply
+        absent from the return value. Deciding that an absence is real, rather than a
+        blip in a cloud API, is a policy question this library has no basis to answer;
+        the caller makes that call and then says so with `async_forget`.
         """
+        current: list[ZafroDevice] = []
         for raw in await self._rest.async_get_devices():
             sn = str(raw.get("sn") or "")
             vendor = str(raw.get("vendor") or "")
             if not sn or not vendor:
                 _LOGGER.warning("Skipping device with no sn/vendor: %r", raw)
                 continue
-            if sn in self._devices:
-                continue
-            device = ZafroDevice(raw, self._mqtt)
-            self._devices[sn] = device
-            self._mqtt.register(device)
-            _LOGGER.debug("Discovered %r", device)
-        return self.devices
+            if (device := self._devices.get(sn)) is None:
+                device = ZafroDevice(raw, self._mqtt)
+                self._devices[sn] = device
+                await self._mqtt.async_register(device)
+                _LOGGER.debug("Discovered %r", device)
+            current.append(device)
+        return current
+
+    async def async_forget(self, sn: str) -> None:
+        """Drop a device this client should stop tracking.
+
+        Unroutes its topics, cancels its pending work, and removes it from `devices`.
+        Unknown serial numbers are ignored, so this is safe to call twice.
+        """
+        device = self._devices.pop(sn, None)
+        if device is None:
+            return
+        await self._mqtt.async_unregister(device)
+        device.close()
+        _LOGGER.debug("Forgot %r", device)
 
     async def async_get_rooms(self) -> list[dict[str, Any]]:
         """Fetch rooms, joinable to devices on room_id."""

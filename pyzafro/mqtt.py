@@ -81,10 +81,48 @@ class ZafroMqtt:
         """Whether the broker connection is currently up."""
         return self._connected.is_set()
 
-    def register(self, sink: FrameSink) -> None:
-        """Route this device's topics to `sink`."""
-        self._sinks[TOPIC_REPLY.format(vendor=sink.vendor, sn=sink.sn)] = sink
-        self._sinks[TOPIC_LWT.format(vendor=sink.vendor, sn=sink.sn)] = sink
+    def _topics(self, sink: FrameSink) -> tuple[str, str]:
+        return (
+            TOPIC_REPLY.format(vendor=sink.vendor, sn=sink.sn),
+            TOPIC_LWT.format(vendor=sink.vendor, sn=sink.sn),
+        )
+
+    async def async_register(self, sink: FrameSink) -> None:
+        """Route this device's topics to `sink`, subscribing if already connected.
+
+        Devices found by a later enumeration arrive while the connection is up, so the
+        subscription cannot wait for the next connect. A failure here is not fatal:
+        every topic in `_sinks` is subscribed again on reconnect.
+        """
+        topics = self._topics(sink)
+        for topic in topics:
+            self._sinks[topic] = sink
+
+        client = self._client
+        if client is None or not self._connected.is_set():
+            return
+        try:
+            for topic in topics:
+                await client.subscribe(topic)
+        except aiomqtt.MqttError as err:
+            _LOGGER.debug(
+                "Deferring subscription for %s to reconnect: %s", sink.sn, err
+            )
+
+    async def async_unregister(self, sink: FrameSink) -> None:
+        """Stop routing this device's topics. Safe to call when never registered."""
+        topics = self._topics(sink)
+        for topic in topics:
+            self._sinks.pop(topic, None)
+
+        client = self._client
+        if client is None or not self._connected.is_set():
+            return
+        try:
+            for topic in topics:
+                await client.unsubscribe(topic)
+        except aiomqtt.MqttError as err:
+            _LOGGER.debug("Could not unsubscribe %s: %s", sink.sn, err)
 
     async def listen(self) -> None:
         """Connect, subscribe, and dispatch forever, reconnecting as needed.
