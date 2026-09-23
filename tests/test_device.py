@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from typing import Any
@@ -22,6 +23,19 @@ RAW = {
     "name": "Air Conditioner",
     "mac": "001cc2000000",
     "version": "1.0.29",
+}
+
+
+#: A real cmd:5 reply. rssi is the field worth re-reading; ssid is why the dump
+#: drops it.
+BASE_INFO = {
+    "v": "I4SEASON",
+    "p": "90038EAC0-12K-ZAZ",
+    "ver": "1.0.29",
+    "mcu_ver": "1.0.01",
+    "mp": "SC95F8613B-3/US",
+    "ssid": "Shannon Family 5G",
+    "rssi": -52,
 }
 
 
@@ -54,8 +68,16 @@ class FakeTransport:
         if self.drop_next > 0:
             self.drop_next -= 1
             return
-        if self.answers is not None and payload.get("cmd") == 3:
+        if self.answers is None:
+            return
+        if payload.get("cmd") == 3:
             self.answers.handle_frame(3, dict(FULL_STATE))
+        elif payload.get("cmd") == 5:
+            self.answers.handle_frame(5, dict(BASE_INFO))
+
+    def sent(self, cmd: int) -> int:
+        """How many frames of one command were published."""
+        return sum(1 for payload in self.published if payload.get("cmd") == cmd)
 
     def register(self, sink: Any) -> None:
         pass
@@ -332,6 +354,7 @@ async def test_a_quiet_but_live_device_stays_available(device):
 async def test_a_device_heard_from_recently_is_not_probed(device):
     """Its traffic is already the answer the probe would have gone looking for."""
     dev, transport = device
+    dev.handle_frame(5, dict(BASE_INFO))  # fresh, so only liveness is in question
     dev.handle_frame(4, {"temperature": 79})
 
     await dev.async_probe()
@@ -467,6 +490,7 @@ async def test_one_lost_request_costs_nothing(device):
     """
     dev, transport = device
     dev.handle_frame(3, FULL_STATE)
+    dev.handle_frame(5, dict(BASE_INFO))
     transport.answers = dev
     transport.drop_next = 1
 
@@ -479,7 +503,7 @@ async def test_one_lost_request_costs_nothing(device):
     assert transport.unresponsive == []
     assert dev._probe_misses == 0
     # It asked again rather than concluding anything from the first silence.
-    assert len(transport.published) == 2
+    assert transport.sent(3) == 2
 
 
 def test_every_availability_change_names_its_cause(device, caplog):
@@ -527,3 +551,91 @@ async def test_the_outage_reason_carries_how_long_it_lasted(device, caplog):
             await dev.async_probe()
 
     assert any("no answer for" in r.getMessage() for r in caplog.records)
+
+
+async def test_signal_strength_is_re_read_while_the_device_is_reachable(device):
+    """The rssi field was read once at setup and never again.
+
+    A dump from a unit that had been up for weeks reported the signal it had when
+    the integration last loaded — which is the first number you would look at for a
+    device that keeps dropping off its network, and it was silently ancient.
+    """
+    dev, transport = device
+    transport.answers = dev
+    dev.handle_frame(3, FULL_STATE)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("pyzafro.device.PROBE_INTERVAL", 0.0)
+        mp.setattr("pyzafro.device.BASE_INFO_INTERVAL", 0.0)
+        await dev.async_probe()
+        await dev.async_probe()
+
+    assert transport.sent(5) == 2
+    assert dev.base_info is not None
+    assert dev.base_info.rssi == -52
+
+
+async def test_base_info_is_left_alone_between_refreshes(device):
+    """It is on a much longer clock than the liveness probe, not every round."""
+    dev, transport = device
+    transport.answers = dev
+    dev.handle_frame(3, FULL_STATE)
+    dev.handle_frame(5, dict(BASE_INFO))
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("pyzafro.device.PROBE_INTERVAL", 0.0)
+        mp.setattr("pyzafro.device.BASE_INFO_INTERVAL", 1000.0)
+        for _ in range(5):
+            await dev.async_probe()
+
+    assert transport.sent(5) == 0
+    assert transport.sent(3) == 5
+
+
+async def test_a_device_that_is_not_answering_is_not_asked_twice(device):
+    """A second request it cannot answer costs a REQUEST_TIMEOUT and tells us nothing.
+
+    The cmd:3 probe already establishes whether the device is there; base info is
+    housekeeping and waits until it is.
+    """
+    dev, transport = device
+    dev.handle_frame(3, FULL_STATE)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("pyzafro.device.PROBE_INTERVAL", 0.0)
+        mp.setattr("pyzafro.device.BASE_INFO_INTERVAL", 0.0)
+        mp.setattr("pyzafro.device.REQUEST_TIMEOUT", 0.01)
+        await dev.async_probe()
+        await dev.async_probe()
+
+    assert transport.sent(5) == 0
+
+
+async def test_a_lost_base_info_reply_is_not_held_against_the_device(device):
+    """Housekeeping must not be able to mark a working device unavailable."""
+    dev, transport = device
+    transport.answers = dev
+    dev.handle_frame(3, FULL_STATE)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("pyzafro.device.PROBE_INTERVAL", 1000.0)
+        mp.setattr("pyzafro.device.BASE_INFO_INTERVAL", 0.0)
+        mp.setattr("pyzafro.device.REQUEST_TIMEOUT", 0.01)
+        mp.setattr("pyzafro.device.UNANSWERED_GRACE", 0.0)
+        transport.drop_next = 10
+        await dev.async_probe()
+
+    assert dev.available
+    assert dev._probe_misses == 0
+    assert transport.unresponsive == []
+
+
+def test_the_dump_says_how_old_the_signal_reading_is(device):
+    dev, _ = device
+    assert dev.diagnostics()["base_info_age"] is None
+
+    dev.handle_frame(5, dict(BASE_INFO))
+
+    assert dev.diagnostics()["base_info_age"] == pytest.approx(0.0, abs=1.0)
+    # And still never carries the network name.
+    assert "Shannon Family 5G" not in json.dumps(dev.diagnostics())

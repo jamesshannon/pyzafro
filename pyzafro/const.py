@@ -74,6 +74,16 @@ PROBE_INTERVAL: Final = 60.0
 #: twice is what separates a dropped publish from a device that is not there.
 PROBE_ATTEMPTS: Final = 2
 
+#: How often the cmd:5 base-info reply is re-read while a device is reachable.
+#:
+#: Model and firmware effectively never change, but `rssi` does, and it used to be
+#: read once during setup and never again — so the wifi signal in a diagnostics dump
+#: was whatever it happened to be when the integration last loaded, possibly weeks
+#: earlier. For a report of a device that keeps dropping off its network, signal
+#: strength is the first thing worth asking about, and a number that stale is worse
+#: than no number at all, because nothing about it looks wrong.
+BASE_INFO_INTERVAL: Final = 300.0
+
 #: How long a device must go on not answering before it is reported unavailable.
 #:
 #: A duration rather than a count of misses. The count was a bad way to say this: it

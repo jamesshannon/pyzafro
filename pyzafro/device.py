@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 from . import capabilities as caps_module
 from .capabilities import Capabilities, Feature
 from .const import (
+    BASE_INFO_INTERVAL,
     CMD_BASE_INFO,
     CMD_CONTROL,
     CMD_STATE,
@@ -103,6 +104,9 @@ class ZafroDevice:
         #: spans. Both cleared the moment the device says anything.
         self._unanswered_since: float | None = None
         self._probe_misses = 0
+        #: When the current base_info was read. Its rssi is the only field that moves,
+        #: and it is the one worth having fresh.
+        self._base_info_at: float | None = None
         # Anomalies are logged once per key, not once per frame: pushes arrive every
         # few seconds and a device on new firmware would otherwise flood the log.
         # The samples are kept so diagnostics() can carry them into a bug report.
@@ -388,14 +392,39 @@ class ZafroDevice:
         until the consumer reloads.
 
         A device that has said something recently is left alone; its traffic is the
-        answer a probe would have gone looking for.
+        answer a probe would have gone looking for. Base info is on its own much
+        longer clock and is refreshed either way, since a device that pushes deltas
+        constantly would otherwise never have its signal strength re-read.
         """
         if (
-            self._last_seen is not None
-            and time.monotonic() - self._last_seen < PROBE_INTERVAL
+            self._last_seen is None
+            or time.monotonic() - self._last_seen >= PROBE_INTERVAL
+        ):
+            await self._safe_refresh()
+        await self._refresh_base_info_if_stale()
+
+    async def _refresh_base_info_if_stale(self) -> None:
+        """Re-read cmd:5 every BASE_INFO_INTERVAL, for its rssi.
+
+        Skipped unless the device is answering: one that is not is already being sent
+        a cmd:3 every round, and a second request it cannot answer would add a
+        REQUEST_TIMEOUT to each of them for no information.
+
+        A failure is not held against the device. The cmd:3 probe is the authority on
+        liveness, this is housekeeping, and a base-info reply that goes missing says
+        nothing a probe has not already said.
+        """
+        if not self.available or self._unanswered_since is not None:
+            return
+        if (
+            self._base_info_at is not None
+            and time.monotonic() - self._base_info_at < BASE_INFO_INTERVAL
         ):
             return
-        await self._safe_refresh()
+        try:
+            await self.async_refresh_base_info()
+        except Exception:
+            _LOGGER.debug("Base info refresh for %s failed", self.name, exc_info=True)
 
     async def _safe_refresh(self) -> None:
         """Re-read state, and account for the answer not arriving.
@@ -490,6 +519,7 @@ class ZafroDevice:
                 {k: v for k, v in result.items() if k not in BASE_INFO_WIRE_KEYS}
             )
             self.base_info = parse_base_info(result)
+            self._base_info_at = time.monotonic()
             self._base_info_event.set()
             self._notify()
             return
@@ -742,6 +772,14 @@ class ZafroDevice:
                 ),
             },
             "base_info": _asdict_or_none(self.base_info, drop={"ssid"}),
+            # How old that reading is. rssi used to be whatever it was when the
+            # integration last loaded, so a dump could present a signal from weeks
+            # earlier as the current one, with nothing about it looking wrong.
+            "base_info_age": (
+                None
+                if self._base_info_at is None
+                else round(time.monotonic() - self._base_info_at, 1)
+            ),
             "state": _asdict_or_none(self.state),
             # The point of the whole anomaly-tracking exercise: whatever this device
             # did that the library did not expect travels with the bug report.
