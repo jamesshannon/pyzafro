@@ -55,6 +55,39 @@ REQUEST_TIMEOUT: Final = 15.0
 #: Seconds after an optimistic write before an unconfirmed field forces a cmd:3 resync.
 RESYNC_DELAY: Final = 5.0
 
+#: How long a device may go without saying anything before it is probed with a cmd:3.
+#:
+#: Nothing else re-reads state. There is no poll, and neither of the two things that
+#: might stand in for one is dependable. The `lwt/` beacon was documented as a ~10-40s
+#: heartbeat, but a 126s capture of a *running* unit carried exactly one and a 103s
+#: capture of the same unit idle carried none, with nothing retained on the topic at
+#: subscribe time either. Unsolicited cmd:4 deltas are just as conditional: 42 in the
+#: first of those captures, 0 in the second. An idle device is simply silent.
+#:
+#: So availability has to be asked for. The probe is 38 bytes and the reply under 600,
+#: once a minute per device, which is what the app does every time a device page opens.
+PROBE_INTERVAL: Final = 60.0
+
+#: Requests one probe makes before it counts as unanswered. Commands go out at QoS 0
+#: — the broker's CONNECT is `wq0` and every publish logs `q0` — so a single request
+#: the device never sees is an ordinary event on this transport, not a fault. Asking
+#: twice is what separates a dropped publish from a device that is not there.
+PROBE_ATTEMPTS: Final = 2
+
+#: How long a device must go on not answering before it is reported unavailable.
+#:
+#: A duration rather than a count of misses. The count was a bad way to say this: it
+#: took REQUEST_TIMEOUT, PROBE_ATTEMPTS and the probe cadence multiplied together to
+#: work out what it meant in seconds, and the answer moved whenever any of them was
+#: tuned. What matters is how long a fault has to last, so that is what this states.
+#:
+#: A floor, not the typical figure: the run is only reviewed when a probe finishes,
+#: so in practice a device is reported unavailable after ~90-110s of continuous
+#: silence — three or four unanswered requests. Deliberately long. An availability
+#: change is recorded by the consumer and read by a human afterwards, so a false one
+#: costs more than a reading that stays a minute stale.
+UNANSWERED_GRACE: Final = 90.0
+
 RECONNECT_MIN_DELAY: Final = 1.0
 RECONNECT_MAX_DELAY: Final = 300.0
 

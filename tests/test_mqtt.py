@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from pyzafro import mqtt as mqtt_module
+from pyzafro.exceptions import ZafroConnectionError
 from pyzafro.mqtt import ZafroMqtt
 
 
@@ -65,6 +66,9 @@ class FakeSink:
 
     def __init__(self) -> None:
         self.presence: list[bool] = []
+        self.probes = 0
+        #: Raised by every probe, to stand in for a device that cannot be reached.
+        self.probe_error: Exception | None = None
 
     def handle_frame(self, cmd: int, result: dict[str, Any]) -> None: ...
 
@@ -72,6 +76,11 @@ class FakeSink:
         self.presence.append(online)
 
     def handle_reconnect(self) -> None: ...
+
+    async def async_probe(self) -> None:
+        self.probes += 1
+        if self.probe_error is not None:
+            raise self.probe_error
 
 
 def _connected_transport() -> tuple[ZafroMqtt, FakeSink]:
@@ -286,3 +295,60 @@ async def test_a_silent_socket_is_abandoned_rather_than_waited_out() -> None:
     # exactly what the old code did to the connection.
     with pytest.raises(mqtt_module._UnresponsiveError):
         await asyncio.wait_for(dispatch, timeout=1)
+
+
+async def test_quiet_devices_are_probed_for_as_long_as_the_connection_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing else re-reads state, so this loop is the only thing that asks."""
+    monkeypatch.setattr(mqtt_module, "PROBE_INTERVAL", 0.02)
+    transport, sink = _connected_transport()
+
+    probe = asyncio.create_task(transport._probe_quiet_devices())
+    await asyncio.sleep(0.07)
+    probe.cancel()
+
+    assert sink.probes >= 2
+
+
+async def test_an_unreachable_device_does_not_end_the_probe_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A device that cannot be reached is the normal case here, not an error.
+
+    If one could end the loop, the first outage on a multi-device account would
+    quietly disable the mechanism for every other device on it.
+    """
+    monkeypatch.setattr(mqtt_module, "PROBE_INTERVAL", 0.02)
+    transport, sink = _connected_transport()
+    sink.probe_error = ZafroConnectionError("not connected to the broker")
+
+    probe = asyncio.create_task(transport._probe_quiet_devices())
+    await asyncio.sleep(0.07)
+    still_running = not probe.done()
+    probe.cancel()
+
+    assert still_running
+    assert sink.probes >= 2
+
+
+async def test_the_probe_loop_stops_with_the_connection() -> None:
+    """It has no life of its own: a probe outliving its socket publishes into it."""
+    transport, sink = _connected_transport()
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(mqtt_module, "PROBE_INTERVAL", 0.02)
+        dispatch = asyncio.create_task(
+            transport._dispatch_until_lost(SilentClient())  # type: ignore[arg-type]
+        )
+        await asyncio.sleep(0.05)
+        assert sink.probes >= 1
+
+        transport.note_unresponsive("SN-A")
+        with pytest.raises(mqtt_module._UnresponsiveError):
+            await asyncio.wait_for(dispatch, timeout=1)
+
+        after_teardown = sink.probes
+        await asyncio.sleep(0.05)
+
+    assert sink.probes == after_teardown

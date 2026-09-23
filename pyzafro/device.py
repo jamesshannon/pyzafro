@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import hashlib
 import logging
+import time
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
@@ -20,8 +21,11 @@ from .const import (
     CMD_CONTROL,
     CMD_STATE,
     CMD_STATE_PUSH,
+    PROBE_ATTEMPTS,
+    PROBE_INTERVAL,
     REQUEST_TIMEOUT,
     RESYNC_DELAY,
+    UNANSWERED_GRACE,
 )
 from .exceptions import ZafroTimeoutError, ZafroUnsupportedError
 from .models import (
@@ -91,6 +95,14 @@ class ZafroDevice:
         self._base_info_event = asyncio.Event()
         self._pending: set[str] = set()
         self._resync_handle: asyncio.TimerHandle | None = None
+        #: Monotonic clock reading of the last frame of any kind from this device.
+        #: None means never heard from, which is a reason to probe rather than a
+        #: reason to wait.
+        self._last_seen: float | None = None
+        #: When the current run of unanswered requests began, and how many probes it
+        #: spans. Both cleared the moment the device says anything.
+        self._unanswered_since: float | None = None
+        self._probe_misses = 0
         # Anomalies are logged once per key, not once per frame: pushes arrive every
         # few seconds and a device on new firmware would otherwise flood the log.
         # The samples are kept so diagnostics() can carry them into a bug report.
@@ -365,23 +377,95 @@ class ZafroDevice:
         task = asyncio.get_running_loop().create_task(self._safe_refresh())
         task.add_done_callback(lambda _: None)
 
-    async def _safe_refresh(self) -> None:
-        """Re-read state, treating no answer as evidence about the connection.
+    async def async_probe(self) -> None:
+        """Confirm the device is still answering, if it has gone quiet.
 
-        A device that is present and still says nothing to a cmd:3 is the earliest
-        sign available that the socket is half-open — the broker has hung up and the
-        client will not notice until its next keepalive, during which every command
-        published is lost. A device the last-will topic has already declared gone
-        explains its own silence, so it is not taken as evidence.
+        Called by the transport on a timer for as long as the connection is up —
+        deliberately including devices already reported unavailable, because a device
+        that cannot be asked can never be found to have come back. An idle device
+        publishes nothing at all (see PROBE_INTERVAL for the captures), so without
+        this the availability a device was last seen in is the availability it keeps
+        until the consumer reloads.
+
+        A device that has said something recently is left alone; its traffic is the
+        answer a probe would have gone looking for.
         """
-        try:
-            await self.async_refresh()
-        except ZafroTimeoutError:
-            _LOGGER.debug("Resync of %s timed out", self.name)
-            if self.available:
-                self._transport.note_unresponsive(self.sn)
-        except Exception:
-            _LOGGER.debug("Resync of %s failed", self.name, exc_info=True)
+        if (
+            self._last_seen is not None
+            and time.monotonic() - self._last_seen < PROBE_INTERVAL
+        ):
+            return
+        await self._safe_refresh()
+
+    async def _safe_refresh(self) -> None:
+        """Re-read state, and account for the answer not arriving.
+
+        The one path behind every unsolicited cmd:3 — the probe, the re-baseline
+        after a reconnect, and an optimistic write that went unconfirmed — so that a
+        device is judged on whether it answers, not on which of the three asked.
+
+        Asks PROBE_ATTEMPTS times before concluding anything. One unanswered request
+        is not evidence: publishes are QoS 0, so a request the device never receives
+        is an ordinary event and the broker will not retry it. Only a device that
+        ignores the question twice has said something.
+
+        A failure that is not a timeout is the transport's, not the device's — there
+        is nothing to hold against it, and nothing to retry while the socket is down.
+        """
+        started = time.monotonic()
+        for _ in range(PROBE_ATTEMPTS):
+            try:
+                await self.async_refresh()
+            except ZafroTimeoutError:
+                continue
+            except Exception:
+                _LOGGER.debug("Resync of %s failed", self.name, exc_info=True)
+                return
+            else:
+                return
+        self._record_miss(since=started)
+
+    def _record_contact(self) -> None:
+        """Note that the device has just been heard from, whatever it said."""
+        self._last_seen = time.monotonic()
+        self._unanswered_since = None
+        self._probe_misses = 0
+
+    def _record_miss(self, *, since: float) -> None:
+        """Account for a probe the device did not answer, `since` having started it.
+
+        Timed from the first unanswered *request*, not from the miss it ended in, so
+        the run measures how long the device has actually been silent rather than how
+        long this library took to notice.
+
+        The first miss is reported to the transport, because it is also the earliest
+        sign of a half-open socket: the broker has hung up, the client will not notice
+        until its next keepalive, and every command published in that window is lost.
+        Reconnecting is cheap and settles the question.
+
+        Later misses are never reported. Silence that survives a reconnect is the
+        device's own, so blaming the socket again would tear down a working connection
+        on every probe for as long as the device stayed away — a reconnect loop whose
+        backoff eventually outgrows OFFLINE_GRACE, which is how this used to end with
+        entities stuck unavailable until the consumer reloaded.
+
+        A device the last-will topic has already declared gone explains its own
+        silence and is never evidence about the socket.
+        """
+        if self._unanswered_since is None:
+            self._unanswered_since = since
+        self._probe_misses += 1
+        unanswered_for = time.monotonic() - self._unanswered_since
+        _LOGGER.debug(
+            "%s has not answered for %.0fs (%d probes)",
+            self.name,
+            unanswered_for,
+            self._probe_misses,
+        )
+        if self._probe_misses == 1 and self.available:
+            self._transport.note_unresponsive(self.sn)
+        if unanswered_for >= UNANSWERED_GRACE:
+            self.handle_presence(online=False)
 
     # --- inbound ---------------------------------------------------------------------
 
@@ -393,6 +477,13 @@ class ZafroDevice:
             except Exception:
                 _LOGGER.exception("Raw subscriber for %s raised", self.sn)
 
+        # Anything arriving on the reply topic is proof of life, including a frame
+        # this version cannot read: availability is about whether the device is
+        # there, not about whether we understood what it said.
+        self._record_contact()
+        became_available = not self.available
+        self.available = True
+
         if cmd == CMD_BASE_INFO:
             self._log_unknown(
                 {k: v for k, v in result.items() if k not in BASE_INFO_WIRE_KEYS}
@@ -402,13 +493,17 @@ class ZafroDevice:
             self._notify()
             return
 
-        if cmd not in {CMD_STATE, CMD_STATE_PUSH}:
-            return
+        updates: dict[str, Any] = {}
+        if cmd in {CMD_STATE, CMD_STATE_PUSH}:
+            parsed = parse_state(result)
+            self._log_anomalies(parsed)
+            updates = parsed.updates
 
-        parsed = parse_state(result)
-        self._log_anomalies(parsed)
-        updates = parsed.updates
         if not updates:
+            # Nothing to merge, but the frame still answered the only question a
+            # probe asks, and coming back from unavailable is worth reporting.
+            if became_available:
+                self._notify()
             return
 
         # Always merge. cmd:4 frames are deltas; treating one as a snapshot would blank
@@ -420,7 +515,6 @@ class ZafroDevice:
             self._pending.clear()
             self._refine_capabilities(updates)
             self._state_event.set()
-        self.available = True
         self._check_capability_drift()
         self._notify()
 
@@ -568,7 +662,13 @@ class ZafroDevice:
         return True
 
     def handle_presence(self, *, online: bool) -> None:
-        """Update availability from the LWT topic, or from a transport drop."""
+        """Update availability from the LWT topic, or from a transport drop.
+
+        A beacon saying the device is up is contact like any other frame, so it also
+        clears any run of unanswered probes and defers the next one.
+        """
+        if online:
+            self._record_contact()
         if self.available != online:
             self.available = online
             self._notify()
@@ -602,6 +702,23 @@ class ZafroDevice:
         return {
             "anon_id": self.anon_id,
             "device_list_entry": redacted,
+            # Why this device is in the availability it is in. "Unavailable and no
+            # contact for hours" and "unavailable ninety seconds ago" are different
+            # bugs, and the dump used to show neither.
+            "liveness": {
+                "available": self.available,
+                "seconds_since_contact": (
+                    None
+                    if self._last_seen is None
+                    else round(time.monotonic() - self._last_seen, 1)
+                ),
+                "unanswered_probes": self._probe_misses,
+                "unanswered_for": (
+                    None
+                    if self._unanswered_since is None
+                    else round(time.monotonic() - self._unanswered_since, 1)
+                ),
+            },
             "base_info": _asdict_or_none(self.base_info, drop={"ssid"}),
             "state": _asdict_or_none(self.state),
             # The point of the whole anomaly-tracking exercise: whatever this device

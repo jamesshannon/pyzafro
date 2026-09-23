@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 import pytest
@@ -42,9 +43,19 @@ class FakeTransport:
     def __init__(self) -> None:
         self.published: list[dict[str, Any]] = []
         self.unresponsive: list[str] = []
+        #: Set to a device to have it answer its own cmd:3, the way a reachable unit
+        #: does. Left None, every request times out.
+        self.answers: ZafroDevice | None = None
+        #: Requests to swallow before answering, standing in for QoS 0 losses.
+        self.drop_next = 0
 
     async def publish(self, vendor: str, sn: str, payload: dict[str, Any]) -> None:
         self.published.append(payload)
+        if self.drop_next > 0:
+            self.drop_next -= 1
+            return
+        if self.answers is not None and payload.get("cmd") == 3:
+            self.answers.handle_frame(3, dict(FULL_STATE))
 
     def register(self, sink: Any) -> None:
         pass
@@ -296,3 +307,176 @@ async def test_a_device_already_known_gone_is_not_evidence(device):
         await dev._safe_refresh()
 
     assert transport.unresponsive == []
+
+
+async def test_a_quiet_but_live_device_stays_available(device):
+    """The case that started this: an air conditioner that is off.
+
+    A 103s capture of one had zero cmd:4 pushes and zero `lwt/` beacons, while still
+    answering cmd:3 with a full state reply. Nothing volunteered means nothing to
+    infer availability from, so it is asked instead.
+    """
+    dev, transport = device
+    dev.handle_frame(3, FULL_STATE)
+    transport.answers = dev
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("pyzafro.device.PROBE_INTERVAL", 0.0)
+        for _ in range(3):
+            await dev.async_probe()
+
+    assert dev.available
+    assert transport.unresponsive == []
+
+
+async def test_a_device_heard_from_recently_is_not_probed(device):
+    """Its traffic is already the answer the probe would have gone looking for."""
+    dev, transport = device
+    dev.handle_frame(4, {"temperature": 79})
+
+    await dev.async_probe()
+
+    assert transport.published == []
+
+
+async def test_a_device_that_stops_answering_goes_unavailable(device):
+    dev, _ = device
+    dev.handle_frame(3, FULL_STATE)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("pyzafro.device.PROBE_INTERVAL", 0.0)
+        mp.setattr("pyzafro.device.REQUEST_TIMEOUT", 0.01)
+        mp.setattr("pyzafro.device.UNANSWERED_GRACE", 0.05)
+        await dev.async_probe()
+        # Early in the run, and a half-open socket looks exactly like this, so the
+        # first miss buys a reconnect rather than an outage.
+        assert dev.available
+
+        while dev.available:
+            await dev.async_probe()
+
+    assert not dev.available
+
+
+async def test_silence_shorter_than_the_grace_is_not_an_outage(device):
+    """The floor users actually feel: a fault has to last before it is reported.
+
+    An availability change is recorded by the consumer and read by a human later, so
+    a device is given UNANSWERED_GRACE of continuous silence before one is written —
+    long enough that a bad minute on a cloud connection passes unremarked.
+    """
+    dev, _ = device
+    dev.handle_frame(3, FULL_STATE)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("pyzafro.device.PROBE_INTERVAL", 0.0)
+        mp.setattr("pyzafro.device.REQUEST_TIMEOUT", 0.01)
+        mp.setattr("pyzafro.device.UNANSWERED_GRACE", 30.0)
+        for _ in range(20):
+            await dev.async_probe()
+
+    assert dev.available
+    assert dev._probe_misses == 20
+
+
+async def test_the_run_is_timed_from_the_request_not_from_noticing(device):
+    """Otherwise the grace silently becomes longer than it says it is.
+
+    A miss is only recorded once the request has timed out, so timing the run from
+    there would discard REQUEST_TIMEOUT of real silence on every probe.
+    """
+    dev, _ = device
+    dev.handle_frame(3, FULL_STATE)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("pyzafro.device.PROBE_INTERVAL", 0.0)
+        mp.setattr("pyzafro.device.REQUEST_TIMEOUT", 0.05)
+        mp.setattr("pyzafro.device.UNANSWERED_GRACE", 1000.0)
+        before = time.monotonic()
+        await dev.async_probe()
+
+    # The run began when the first request went out, not when it gave up on it.
+    assert dev._unanswered_since is not None
+    assert dev._unanswered_since <= before + 0.01
+
+
+async def test_only_the_first_miss_blames_the_socket(device):
+    """An absent device must not tear the connection down on every probe.
+
+    That loop is how this used to end badly: each reconnect re-baselined, timed out,
+    and reconnected again with a longer backoff, until the backoff outgrew
+    OFFLINE_GRACE and the entities went unavailable for good.
+    """
+    dev, transport = device
+    dev.handle_frame(3, FULL_STATE)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("pyzafro.device.PROBE_INTERVAL", 0.0)
+        mp.setattr("pyzafro.device.REQUEST_TIMEOUT", 0.01)
+        for _ in range(5):
+            await dev.async_probe()
+
+    assert transport.unresponsive == [dev.sn]
+
+
+async def test_an_unavailable_device_is_still_probed_and_can_return(device):
+    """The regression the whole mechanism exists for.
+
+    Availability only ever came back on an inbound frame, and an unavailable device
+    was asked for nothing — so an idle unit that had been marked gone had no way back
+    short of reloading the integration, which is exactly what users had to do.
+    """
+    dev, transport = device
+    dev.handle_frame(3, FULL_STATE)
+    seen: list[bool] = []
+    dev.subscribe(lambda d: seen.append(d.available))
+    dev.handle_presence(online=False)
+    assert not dev.available
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("pyzafro.device.PROBE_INTERVAL", 0.0)
+        mp.setattr("pyzafro.device.REQUEST_TIMEOUT", 0.01)
+        await dev.async_probe()
+        assert not dev.available
+
+        transport.answers = dev  # the unit comes back
+        await dev.async_probe()
+
+    assert dev.available
+    assert seen[-1] is True
+    # A device already known gone never implicates the socket on its way back.
+    assert transport.unresponsive == []
+
+
+async def test_a_frame_we_cannot_read_still_counts_as_present(device):
+    """Availability is about whether the device is there, not whether we parsed it."""
+    dev, _ = device
+    dev.handle_presence(online=False)
+
+    dev.handle_frame(4, {"ionizer": True})
+
+    assert dev.available
+
+
+async def test_one_lost_request_costs_nothing(device):
+    """Publishes are QoS 0, so a request the device never sees is routine.
+
+    Treating a single one as evidence would reconnect the whole account's socket on
+    an ordinary event, and two in a row would flap the entities — which a consumer
+    records, making it more expensive for a user than a reading a minute stale.
+    """
+    dev, transport = device
+    dev.handle_frame(3, FULL_STATE)
+    transport.answers = dev
+    transport.drop_next = 1
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("pyzafro.device.PROBE_INTERVAL", 0.0)
+        mp.setattr("pyzafro.device.REQUEST_TIMEOUT", 0.01)
+        await dev.async_probe()
+
+    assert dev.available
+    assert transport.unresponsive == []
+    assert dev._probe_misses == 0
+    # It asked again rather than concluding anything from the first silence.
+    assert len(transport.published) == 2

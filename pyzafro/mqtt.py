@@ -17,6 +17,7 @@ import aiomqtt
 
 from .const import (
     OFFLINE_GRACE,
+    PROBE_INTERVAL,
     RECONNECT_MAX_DELAY,
     RECONNECT_MIN_DELAY,
     RECONNECT_RESET_AFTER,
@@ -58,6 +59,9 @@ class FrameSink(Protocol):
 
     def handle_reconnect(self) -> None:
         """Re-baseline after a reconnect, since missed deltas are never replayed."""
+
+    async def async_probe(self) -> None:
+        """Confirm the device is still there, if it has gone quiet."""
 
 
 class ZafroMqtt:
@@ -244,26 +248,65 @@ class ZafroMqtt:
         The iteration itself cannot notice a half-open socket — that is the whole
         problem — so it is raced against `_unresponsive`, which a device sets when a
         request it expected an answer to went unanswered.
+
+        The probe loop runs alongside for the same lifetime. It never finishes on its
+        own; racing it here is how it gets cancelled when the connection ends, and how
+        a bug in it surfaces as a dropped connection rather than as silence.
         """
         self._unresponsive.clear()
         pump = asyncio.create_task(self._pump(client))
         declared = asyncio.create_task(self._unresponsive.wait())
+        probe = asyncio.create_task(self._probe_quiet_devices())
         try:
             done, _ = await asyncio.wait(
-                (pump, declared), return_when=asyncio.FIRST_COMPLETED
+                (pump, declared, probe), return_when=asyncio.FIRST_COMPLETED
             )
         finally:
-            for task in (pump, declared):
+            for task in (pump, declared, probe):
                 task.cancel()
         if pump in done:
             # Re-raises whatever ended the iteration, usually an MqttError.
             pump.result()
             return
+        if probe in done:
+            probe.result()  # Re-raises; it has no successful ending.
+            raise _UnresponsiveError("Probe loop ended on its own")
         raise _UnresponsiveError("Broker stopped answering")
 
     async def _pump(self, client: aiomqtt.Client) -> None:
         async for message in client.messages:
             self._dispatch(str(message.topic), message.payload)
+
+    async def _probe_quiet_devices(self) -> None:
+        """Ask every device that has gone quiet to prove it is still there.
+
+        Nothing else re-reads state. The coordinator above this library is pure push,
+        an idle device publishes no deltas, and the `lwt/` beacon is not the heartbeat
+        it was documented as (see PROBE_INTERVAL). So a device's availability was only
+        ever as current as the last thing it volunteered, and a device that went away
+        unannounced stayed "available" while a device wrongly marked unavailable had
+        no way back short of the consumer reloading the integration.
+
+        Devices already reported unavailable are probed too. That is the case this
+        exists for: a probe is the only thing that can discover a device has returned.
+
+        The tick is half the interval so a device is found late by at most that much,
+        and each device decides for itself whether it is quiet enough to be worth a
+        frame — recent traffic is already the answer a probe would go looking for.
+        """
+        while True:
+            await asyncio.sleep(PROBE_INTERVAL / 2)
+            sinks = set(self._sinks.values())
+            if not sinks:
+                continue
+            # One slow or failing device must not hold up or silence the others, and
+            # no probe may end this loop: a device that cannot be reached is the
+            # normal case here, not an error.
+            for outcome in await asyncio.gather(
+                *(sink.async_probe() for sink in sinks), return_exceptions=True
+            ):
+                if isinstance(outcome, Exception):
+                    _LOGGER.debug("Probe failed: %r", outcome)
 
     def note_unresponsive(self, sn: str) -> None:
         """Report that a device answered nothing, so the connection looks dead.
@@ -273,9 +316,10 @@ class ZafroMqtt:
         out is the earliest evidence available, so it is used to tear the connection
         down rather than waiting for the ping to notice.
 
-        The caller only reports this for a device it still believes is present; a
-        device the last-will topic has already declared gone explains its own silence
-        and says nothing about the socket.
+        Callers report only the *first* unanswered request from a device they still
+        believe is present. Silence that outlives the reconnect this causes is the
+        device's own and is reported as availability instead — see
+        `ZafroDevice._record_miss`, which is where that judgement lives.
         """
         if not self._connected.is_set() or self._unresponsive.is_set():
             return
