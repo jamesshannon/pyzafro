@@ -11,7 +11,7 @@ import json
 import logging
 import random
 import ssl
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Final, Protocol
 
 import aiomqtt
 
@@ -36,6 +36,26 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
+#: Masked in logged frames. The cmd:5 reply carries the user's wifi network name,
+#: which is no part of any bug about this integration and which someone pasting a
+#: debug log into an issue cannot be expected to spot. `diagnostics()` already drops
+#: it; a log that did not would undo that.
+_SENSITIVE_KEYS: Final = frozenset({"ssid"})
+
+
+def _loggable(frame: dict[str, Any]) -> dict[str, Any]:
+    """Return the frame as it should appear in the log, sensitive values masked."""
+    result = frame.get("result")
+    if not isinstance(result, dict) or not _SENSITIVE_KEYS & result.keys():
+        return frame
+    return {
+        **frame,
+        "result": {
+            key: ("***" if key in _SENSITIVE_KEYS else value)
+            for key, value in result.items()
+        },
+    }
+
 
 class _UnresponsiveError(Exception):
     """The broker stopped answering, so the socket is treated as already dead.
@@ -54,8 +74,8 @@ class FrameSink(Protocol):
     def handle_frame(self, cmd: int, result: dict[str, Any]) -> None:
         """Accept a state, base-info, or control reply frame."""
 
-    def handle_presence(self, *, online: bool) -> None:
-        """Accept a presence update from the LWT topic."""
+    def handle_presence(self, *, online: bool, reason: str) -> None:
+        """Accept a presence update, `reason` naming what prompted it."""
 
     def handle_reconnect(self) -> None:
         """Re-baseline after a reconnect, since missed deltas are never replayed."""
@@ -329,6 +349,9 @@ class ZafroMqtt:
     def _dispatch(self, topic: str, payload: Any) -> None:
         sink = self._sinks.get(topic)
         if sink is None:
+            # Subscribed to a topic nothing claims, or a device forgotten while a
+            # frame was in flight. Silence here would hide a routing bug completely.
+            _LOGGER.debug("<- %s (no device routed to this topic)", topic)
             return
         try:
             frame = json.loads(
@@ -338,10 +361,20 @@ class ZafroMqtt:
             _LOGGER.warning("Unparseable payload on %s: %r", topic, payload)
             return
         if not isinstance(frame, dict):
+            _LOGGER.warning("Ignoring non-object frame on %s: %r", topic, frame)
             return
 
+        # Mirrors the "-> " line in publish(). Without it the only record of what a
+        # device said was aiomqtt's own "Received PUBLISH ... (566 bytes)", which
+        # gives the topic and the byte count and not one field of the content — so
+        # any question about what a device actually reported could only be answered
+        # by reading this source, never from a log a user could send.
+        _LOGGER.debug("<- %s %s", topic, _loggable(frame))
+
         if topic.startswith("lwt/"):
-            sink.handle_presence(online=bool(frame.get("status")))
+            sink.handle_presence(
+                online=bool(frame.get("status")), reason="last-will topic"
+            )
             return
 
         cmd = frame.get("cmd")
@@ -364,10 +397,12 @@ class ZafroMqtt:
             return
         self._connected.clear()
         if not may_return:
-            self._mark_all_offline()
+            self._mark_all_offline("credentials rejected")
             return
         self._offline_handle = asyncio.get_running_loop().call_later(
-            OFFLINE_GRACE, self._mark_all_offline
+            OFFLINE_GRACE,
+            self._mark_all_offline,
+            f"no broker connection for {OFFLINE_GRACE:.0f}s",
         )
 
     def _handle_shutdown(self) -> None:
@@ -387,10 +422,10 @@ class ZafroMqtt:
             self._offline_handle.cancel()
             self._offline_handle = None
 
-    def _mark_all_offline(self) -> None:
+    def _mark_all_offline(self, reason: str) -> None:
         self._offline_handle = None
         for sink in set(self._sinks.values()):
-            sink.handle_presence(online=False)
+            sink.handle_presence(online=False, reason=reason)
 
     def close(self) -> None:
         """Drop scheduled work. The listener task is the caller's to cancel."""

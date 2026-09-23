@@ -465,7 +465,9 @@ class ZafroDevice:
         if self._probe_misses == 1 and self.available:
             self._transport.note_unresponsive(self.sn)
         if unanswered_for >= UNANSWERED_GRACE:
-            self.handle_presence(online=False)
+            self.handle_presence(
+                online=False, reason=f"no answer for {unanswered_for:.0f}s"
+            )
 
     # --- inbound ---------------------------------------------------------------------
 
@@ -481,8 +483,7 @@ class ZafroDevice:
         # this version cannot read: availability is about whether the device is
         # there, not about whether we understood what it said.
         self._record_contact()
-        became_available = not self.available
-        self.available = True
+        became_available = self._set_available(available=True, reason=f"cmd:{cmd}")
 
         if cmd == CMD_BASE_INFO:
             self._log_unknown(
@@ -661,17 +662,38 @@ class ZafroDevice:
         self._drift.add(what)
         return True
 
-    def handle_presence(self, *, online: bool) -> None:
-        """Update availability from the LWT topic, or from a transport drop.
+    def handle_presence(self, *, online: bool, reason: str) -> None:
+        """Update availability from the LWT topic, a transport drop, or a dead probe.
 
         A beacon saying the device is up is contact like any other frame, so it also
         clears any run of unanswered probes and defers the next one.
+
+        `reason` names what prompted the change and goes in the log beside it.
         """
         if online:
             self._record_contact()
-        if self.available != online:
-            self.available = online
+        if self._set_available(available=online, reason=reason):
             self._notify()
+
+    def _set_available(self, *, available: bool, reason: str) -> bool:
+        """Record availability, logging any change. Returns whether it changed.
+
+        Every path that can reach availability goes through here, because an outage
+        with no cause recorded next to it is the hardest kind of bug report to answer.
+        The event a user reports — "the entities went unavailable" — is precisely the
+        one this library used to pass over without a word, so a debug log covering the
+        failure could be handed over and still not say what happened.
+        """
+        if self.available == available:
+            return False
+        self.available = available
+        _LOGGER.debug(
+            "%s is now %s (%s)",
+            self.name,
+            "available" if available else "unavailable",
+            reason,
+        )
+        return True
 
     def handle_reconnect(self) -> None:
         """Re-baseline after a reconnect; missed deltas are never replayed."""

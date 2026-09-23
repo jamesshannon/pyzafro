@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import ssl
 import threading
 from typing import Any
@@ -66,14 +67,16 @@ class FakeSink:
 
     def __init__(self) -> None:
         self.presence: list[bool] = []
+        self.reasons: list[str] = []
         self.probes = 0
         #: Raised by every probe, to stand in for a device that cannot be reached.
         self.probe_error: Exception | None = None
 
     def handle_frame(self, cmd: int, result: dict[str, Any]) -> None: ...
 
-    def handle_presence(self, *, online: bool) -> None:
+    def handle_presence(self, *, online: bool, reason: str) -> None:
         self.presence.append(online)
+        self.reasons.append(reason)
 
     def handle_reconnect(self) -> None: ...
 
@@ -352,3 +355,58 @@ async def test_the_probe_loop_stops_with_the_connection() -> None:
         await asyncio.sleep(0.05)
 
     assert sink.probes == after_teardown
+
+
+def test_inbound_frames_are_logged_with_their_contents(caplog) -> None:
+    """The aiomqtt logger gives topic and byte count; content was nowhere."""
+    transport, _ = _connected_transport()
+    transport._sinks["dev/I4SEASON/SN-A/command/reply"] = transport._sinks["dev/reply"]
+
+    with caplog.at_level(logging.DEBUG, logger="pyzafro.mqtt"):
+        transport._dispatch(
+            "dev/I4SEASON/SN-A/command/reply",
+            b'{"cmd": 4, "result": {"temperature": 79}}',
+        )
+
+    logged = [r.getMessage() for r in caplog.records if r.getMessage().startswith("<-")]
+    assert len(logged) == 1
+    assert "temperature" in logged[0]
+    assert "79" in logged[0]
+
+
+def test_the_wifi_network_never_reaches_the_log(caplog) -> None:
+    """diagnostics() drops it deliberately; a raw frame log would undo that."""
+    transport, _ = _connected_transport()
+    transport._sinks["dev/I4SEASON/SN-A/command/reply"] = transport._sinks["dev/reply"]
+
+    with caplog.at_level(logging.DEBUG, logger="pyzafro.mqtt"):
+        transport._dispatch(
+            "dev/I4SEASON/SN-A/command/reply",
+            b'{"cmd": 5, "result": {"ssid": "Shannon Family 5G", "rssi": -52}}',
+        )
+
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "Shannon Family 5G" not in logged
+    # Still visibly present, so nobody wonders whether the device reported it.
+    assert "ssid" in logged
+    assert "-52" in logged
+
+
+def test_a_frame_for_an_unrouted_topic_is_not_silent(caplog) -> None:
+    """Otherwise a routing bug looks exactly like a device that said nothing."""
+    transport, _ = _connected_transport()
+
+    with caplog.at_level(logging.DEBUG, logger="pyzafro.mqtt"):
+        transport._dispatch("dev/I4SEASON/SN-Z/command/reply", b'{"cmd": 4}')
+
+    assert any("no device routed" in r.getMessage() for r in caplog.records)
+
+
+async def test_an_outage_from_the_transport_says_so(caplog) -> None:
+    """The device cannot know why it went unavailable; the transport has to say."""
+    transport, sink = _connected_transport()
+
+    with caplog.at_level(logging.DEBUG, logger="pyzafro.mqtt"):
+        transport._handle_disconnect(may_return=False)
+
+    assert sink.reasons == ["credentials rejected"]

@@ -300,7 +300,7 @@ async def test_a_device_already_known_gone_is_not_evidence(device):
     """The last-will topic explained the silence; the socket is not implicated."""
     dev, transport = device
     dev.handle_frame(3, FULL_STATE)
-    dev.handle_presence(online=False)
+    dev.handle_presence(online=False, reason="test")
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr("pyzafro.device.REQUEST_TIMEOUT", 0.01)
@@ -430,7 +430,7 @@ async def test_an_unavailable_device_is_still_probed_and_can_return(device):
     dev.handle_frame(3, FULL_STATE)
     seen: list[bool] = []
     dev.subscribe(lambda d: seen.append(d.available))
-    dev.handle_presence(online=False)
+    dev.handle_presence(online=False, reason="test")
     assert not dev.available
 
     with pytest.MonkeyPatch.context() as mp:
@@ -451,7 +451,7 @@ async def test_an_unavailable_device_is_still_probed_and_can_return(device):
 async def test_a_frame_we_cannot_read_still_counts_as_present(device):
     """Availability is about whether the device is there, not whether we parsed it."""
     dev, _ = device
-    dev.handle_presence(online=False)
+    dev.handle_presence(online=False, reason="test")
 
     dev.handle_frame(4, {"ionizer": True})
 
@@ -480,3 +480,50 @@ async def test_one_lost_request_costs_nothing(device):
     assert dev._probe_misses == 0
     # It asked again rather than concluding anything from the first silence.
     assert len(transport.published) == 2
+
+
+def test_every_availability_change_names_its_cause(device, caplog):
+    """A debug log covering the failure has to say what happened.
+
+    The event users report is "the entities went unavailable", and that was the one
+    event this library wrote nothing about — so the logs you would ask for could
+    cover the whole outage and still not answer the question.
+    """
+    dev, _ = device
+    with caplog.at_level(logging.DEBUG, logger="pyzafro.device"):
+        dev.handle_frame(3, FULL_STATE)
+        dev.handle_presence(online=False, reason="last-will topic")
+        dev.handle_frame(4, {"temperature": 79})
+
+    changes = [r.getMessage() for r in caplog.records if " is now " in r.getMessage()]
+    assert len(changes) == 3
+    assert "available (cmd:3)" in changes[0]
+    assert "unavailable (last-will topic)" in changes[1]
+    assert "available (cmd:4)" in changes[2]
+
+
+def test_an_unchanged_availability_is_not_logged(device, caplog):
+    """Beacons arrive repeatedly; only transitions are worth a line."""
+    dev, _ = device
+    dev.handle_presence(online=True, reason="last-will topic")
+
+    with caplog.at_level(logging.DEBUG, logger="pyzafro.device"):
+        for _ in range(5):
+            dev.handle_presence(online=True, reason="last-will topic")
+
+    assert [r for r in caplog.records if " is now " in r.getMessage()] == []
+
+
+async def test_the_outage_reason_carries_how_long_it_lasted(device, caplog):
+    """An outage and an outage that lasted 90s are different reports."""
+    dev, _ = device
+    dev.handle_frame(3, FULL_STATE)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("pyzafro.device.PROBE_INTERVAL", 0.0)
+        mp.setattr("pyzafro.device.REQUEST_TIMEOUT", 0.01)
+        mp.setattr("pyzafro.device.UNANSWERED_GRACE", 0.0)
+        with caplog.at_level(logging.DEBUG, logger="pyzafro.device"):
+            await dev.async_probe()
+
+    assert any("no answer for" in r.getMessage() for r in caplog.records)
