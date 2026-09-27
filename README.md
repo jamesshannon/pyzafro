@@ -79,19 +79,23 @@ consequence the device has not reported.
 **Temperatures are in the device's own unit.** `DeviceState.temperature_unit` says which.
 Values are not normalised to Celsius; convert at the edge if you need to.
 
-**The fan is one control with five positions, not two axes.** `fan_speed` 1-4 are the
-positions the remote's fan button cycles — three bars and auto — and `extra`, reached by
-holding that button, is the fifth. It is a field of its own and comes back alongside a
-speed, so `state.extra` has to be read before `state.fan_speed` means anything.
-`async_set_fan_speed` leaves EXTRA, sleep and eco on the way past, the way the app does,
-because the device overrides the speed for the latter two.
+**The fan is one control with six positions, not three axes.** `fan_speed` 1-4 are the
+positions the remote's fan button cycles — three bars and auto — `extra`, reached by
+holding that button, is above them, and `sleep` is below them. Both of those are fields
+of their own and both come back alongside a `fan_speed`, so `state.sleep` and
+`state.extra` have to be read before `state.fan_speed` means anything.
+
+Entering any position leaves the others: `async_set_fan_speed` clears sleep, EXTRA and
+eco (the app's own speed payload does, because the device overrides the speed under the
+last two), and `async_set_sleep` and `async_set_extra` clear each other.
 
 EXTRA is the vendor's own name for it, on the unit's display and in the app; the app's
 code calls it `turbo` internally, and nothing here does.
 
 **Fan speed `0` is not off, and cannot be asked for.** It is the speed sleep mode drops
-to, with the unit still running. It is reported but is on no dial, so it is absent from
-`fan_speeds`.
+to, with the unit still running. Commanding it directly is acknowledged and then undone
+by the device about five seconds later, so it is absent from `fan_speeds`: `sleep` is the
+way to that speed.
 
 ## The diagnostic tool
 

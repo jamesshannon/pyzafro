@@ -229,25 +229,42 @@ class ZafroDevice:
             raise ZafroUnsupportedError(
                 f"{self.name} fan speed must be one of {self.capabilities.fan_speeds}"
             )
-        fields: dict[str, Any] = {"fan_speed": level}
-        for feature, field in (
-            (Feature.EXTRA, "extra"),
-            (Feature.SLEEP, "sleep"),
-            (Feature.ECO, "eco"),
-        ):
-            if self.capabilities.has(feature):
-                fields[field] = False
+        fields = {"fan_speed": level, **self._leaving_fan_positions()}
+        # Only a speed clears eco, and only because the app's own speed payload does.
+        # Inferring it anywhere else would be turning a programme off on the user's
+        # behalf on the strength of a guess.
+        if self.capabilities.has(Feature.ECO):
+            fields["eco"] = False
         await self._async_command(**fields)
 
     async def async_set_extra(self, *, on: bool) -> None:
         """Toggle EXTRA, the fan position beyond the top of the speed range.
 
-        Sent alone, like the app's own button. The device answers with the fan speed it
-        chose to run at — a real long press reported {"windlevel": 3, "extra": true} —
-        so `state.fan_speed` alone cannot tell you the fan is in EXTRA.
+        The device answers with the fan speed it chose to run at — a real long press
+        reported {"windlevel": 3, "extra": true} — so `state.fan_speed` alone cannot
+        tell you the fan is in EXTRA.
         """
         self._require(Feature.EXTRA)
-        await self._async_command(extra=on)
+        await self._async_command(extra=on, **self._leaving_fan_positions("extra"))
+
+    def _leaving_fan_positions(self, keep: str | None = None) -> dict[str, bool]:
+        """Clear every fan position except `keep`.
+
+        Sleep and EXTRA are positions of the same control as the four speeds — the fan
+        cannot be at sleep's speed and at EXTRA's at once — so entering any one of them
+        leaves the rest. The app publishes each alone and lets the device work that out,
+        and the device does; saying it explicitly is what makes an optimistic view of
+        the control right the moment it is asked for, instead of a second later when
+        the device gets round to mentioning it.
+
+        Restricted to positions the model has, so nothing is sent that a device would
+        have no field for.
+        """
+        return {
+            field: False
+            for feature, field in ((Feature.SLEEP, "sleep"), (Feature.EXTRA, "extra"))
+            if field != keep and self.capabilities.has(feature)
+        }
 
     async def async_set_swing(
         self, *, horizontal: bool | None = None, vertical: bool | None = None
@@ -264,13 +281,17 @@ class ZafroDevice:
             await self._async_command(**fields)
 
     async def async_set_sleep(self, *, on: bool) -> None:
-        """Toggle sleep mode.
+        """Toggle sleep mode, which is also a position of the fan control.
 
-        The device reacts by setting mute and moving the fan speed; those arrive as a
-        separate device-originated push and are not assumed here.
+        It drops the fan below its slowest selectable speed — `windlevel: 0`, which
+        nothing else can reach — so it leaves EXTRA on the way in, like any other fan
+        position.
+
+        The rest of what the device does in response, setting mute and moving the fan
+        speed, arrives as a separate device-originated push and is not assumed here.
         """
         self._require(Feature.SLEEP)
-        await self._async_command(sleep=on)
+        await self._async_command(sleep=on, **self._leaving_fan_positions("sleep"))
 
     async def async_set_eco(self, *, on: bool) -> None:
         """Toggle eco mode. The device moves the setpoint as a side effect."""

@@ -130,13 +130,13 @@ async def test_a_speed_also_leaves_extra_and_what_overrides_it(device):
     assert dev.state.extra is False
 
 
-async def test_extra_is_sent_alone(device):
-    """Like the app's own button. The device reports the speed it picked itself."""
+async def test_extra_carries_no_speed_of_its_own(device):
+    """The device picks the speed. Nothing here asks for one."""
     dev, transport = device
     dev.handle_frame(3, dict(FULL_STATE))
     await dev.async_set_extra(on=True)
 
-    assert transport.published[0]["data"]["state"] == {"extra": True}
+    assert "windlevel" not in transport.published[0]["data"]["state"]
     assert dev.state.extra is True
 
     # Captured from a real long press: EXTRA arrives with windlevel 3, not a speed of
@@ -162,9 +162,45 @@ async def test_the_sleep_fan_speed_is_not_capability_drift(device, caplog):
 async def test_commands_are_never_padded(device):
     dev, transport = device
     dev.handle_frame(3, {"mode": 3})
-    # sleep in fan mode is unverified but not forbidden; it is sent alone, not padded.
+    # The beeper in fan mode is unverified but not forbidden; it is sent alone, with no
+    # mode-dependent field invented to keep it company.
+    await dev.async_set_mute(on=True)
+    assert transport.published[0]["data"]["state"] == {"muteon": True}
+
+
+async def test_the_fan_positions_are_exclusive(device):
+    """Sleep and EXTRA are two positions of one control, so each leaves the other.
+
+    The fan cannot be at sleep's speed and EXTRA's at the same time. The app publishes
+    each of them alone and lets the device sort it out; saying it explicitly is what
+    makes a consumer's own view of the control unambiguous the moment it is asked for,
+    rather than a second later when the device gets around to mentioning it.
+    """
+    dev, transport = device
+    dev.handle_frame(3, {**FULL_STATE, "sleep": True, "windlevel": 0})
+
+    await dev.async_set_extra(on=True)
+    assert transport.published[-1]["data"]["state"] == {"extra": True, "sleep": False}
+    assert dev.state.sleep is False
+
     await dev.async_set_sleep(on=True)
-    assert transport.published[0]["data"]["state"] == {"sleep": True}
+    assert transport.published[-1]["data"]["state"] == {"sleep": True, "extra": False}
+    assert dev.state.extra is False
+
+
+async def test_eco_is_not_a_fan_position(device):
+    """It forces a speed, but it is a programme that runs alongside one.
+
+    Only a speed command clears it, and only because the app's own speed payload does —
+    evidence, where inferring it from eco's side effects would be guesswork. Nothing
+    here turns eco off on the user's behalf.
+    """
+    dev, transport = device
+    dev.handle_frame(3, {**FULL_STATE, "eco": True})
+
+    await dev.async_set_sleep(on=True)
+    assert "eco" not in transport.published[-1]["data"]["state"]
+    assert dev.state.eco is True
 
 
 async def test_cool_mode_keeps_setpoint(device):
