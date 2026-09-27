@@ -17,7 +17,7 @@ catching someone else's mistakes.
 
 **This runs the machine.** It is the full integration suite: rare, explicitly asked for,
 and thorough in preference to quick or gentle. It will turn the unit on, drive the
-compressor, dehumidify, and take fifteen-odd minutes over it, because the assumptions
+compressor, dehumidify, and take ten minutes or so over it, because the assumptions
 that cost the most to get wrong — whether the thermostat really reports being satisfied,
 whether a range in the table is the device's own — cannot be answered by a unit that is
 not doing any work. A baseline is read first and restored afterwards, including after a
@@ -60,21 +60,16 @@ _LOGGER = logging.getLogger(__name__)
 
 #: How long to let the device finish reacting before believing its state. A reaction the
 #: device *sends* — a refusal, a side effect, a correction it means to make — arrives in
-#: the frame right after the acknowledgement, 0.5-1.5s later: a refused programme flag
-#: came back at 0.54s in four runs, the sleep-exit speed restore at 1.1s. Six seconds is
+#: the frame right after the acknowledgement, within a second or two. Six seconds is
 #: several times over that, and being generous only costs a slower run.
 #:
 #: What a settle cannot outlast is a correction the device never sends, which arrives
-#: whenever its next unsolicited broadcast happens to go out. That is `UNDO_WAIT`, and
-#: the difference between the two is the difference between a check that measures
-#: something and one that flips a coin.
+#: whenever its next unsolicited broadcast happens to go out. That is `UNDO_WAIT`.
 SETTLE = 6.0
 
-#: The ceiling on any single wait, and what `--max-wait` sets. It was called SOAK, for
-#: "how long to let the machine run", which is not a thing any check does any more:
-#: nothing waits on the room, so nothing needs three minutes. What it does now is cap
-#: every other deadline, which is also what collapses every wait to nothing in the unit
-#: tests.
+#: The ceiling on any single wait, and what `--max-wait` sets. Nothing here waits on the
+#: room, so nothing needs three minutes; what this does is cap every other deadline,
+#: which is also what collapses every wait to nothing in the unit tests.
 #:
 #: A deadline, not a duration, wherever it is used. Every wait ends the moment the thing
 #: it is waiting for has happened, so a healthy unit spends a fraction of any of these
@@ -90,9 +85,9 @@ POLL = 15.0
 #: How long a power-down needs before the state it leaves behind is the off state. The
 #: window unit runs a turn-off timer of about twenty seconds — the fan keeps going while
 #: the unit winds down — so anything read inside that window is a unit still shutting
-#: down and says nothing about a unit that is off. A settle is nowhere near it, and the
-#: first version of the off-state check read at 5.5s and again at 12.1s, then powered
-#: the unit back on at 12.7s. It never once saw the unit off.
+#: down and says nothing about a unit that is off. A settle is nowhere near it: earlier
+#: versions of the off-state check read the state and powered the unit back on well
+#: inside the timer, so they never once saw the unit off.
 #:
 #: Rounded up past the timer, and the poll interval takes the real wait past it again. A
 #: fixed window rather than a pure deadline, because "the fan never parked" can only be
@@ -103,12 +98,12 @@ POWER_DOWN = 25.0
 #: different thing from one it refuses. Asked for fan speed 0 the unit says 0, keeps
 #: saying 0, and then reports the speed it is really running — not in a correcting frame
 #: of its own, but riding the next ambient reading it was going to push anyway. Those
-#: come about every 5s and on nobody's schedule, so the wait has to be a deadline: the
-#: revert landed 4.05s after the acknowledgement in run 2, 4.12s in run 3 and 6.0s in
-#: run 4, where a settle read the state 0.6s too early and called a true claim false.
+#: come every few seconds and on nobody's schedule, so the wait has to be a deadline:
+#: measured latencies of four to six seconds mean a settle can read the state just
+#: before the truth arrives and call a true claim false, which is what happened.
 #:
 #: Generous, because the tail is unbounded and a deadline costs nothing when the device
-#: answers. The healthy case now ends sooner than the settle it replaced.
+#: answers.
 UNDO_WAIT = 30.0
 
 #: How often to ask while waiting for a contradiction. Far finer than `POLL`, because
@@ -313,24 +308,19 @@ class Context:
 
         For the claims of the form "the device will not hold that": the value goes out,
         the device acknowledges it, and the truth follows separately. A settle is the
-        wrong instrument for all of them, because it decides the device never answered
-        by not having heard from it yet — which is how the check on fan speed 0 failed a
-        true claim in run 4 by six tenths of a second.
+        wrong instrument for all of them, because it takes "we have not heard yet" for
+        "the device never answered".
 
         Returns the seconds the device took, or None if it kept the value for the whole
-        of `UNDO_WAIT`, which is the only reading that means it really does hold it.
-        None is the failure and the caller says what it would mean; the number is worth
-        recording either way, because a refusal and a contradiction are an order of
-        magnitude apart and which one this is tells a consumer whether the device
-        rejected the value or merely never stored it.
+        of `UNDO_WAIT`, which is the only reading that means it really does hold it. The
+        number is worth recording either way: a refusal and a contradiction are an order
+        of magnitude apart, and which one this is says whether the device rejected the
+        value or merely never stored it.
 
         Settles before waiting, and that part is not an optimisation. `until` asks
         whether the value has changed before it yields, and a value the device has not
-        acknowledged yet has not changed either — so without the settle every one of
-        these reads the state from before the command and reports that the device undid
-        something it had not yet been told. Two tests caught exactly that. A settle is
-        the established way to let an acknowledgement land, so the wait starts after one
-        and the returned figure counts from before it.
+        acknowledged yet has not changed either — so without the settle this reads the
+        state from before the command and reports an undo that has not happened.
         """
         started = time.monotonic()
         await self.settle()
@@ -382,11 +372,10 @@ class Context:
         """Record a failure without abandoning the claims after it.
 
         For a check that walks a list — every claimed feature, both ends of a range —
-        where stopping at the first bad one hides every later one behind it. A live run
-        found the table claiming a display switch the device ignores, and because that
-        aborted the loop the mute switch went untested; the same run never reached the
-        humidity range's narrowness probe because the clamp check ahead of it failed.
-        One run should name everything wrong with the table, not the first thing.
+        where stopping at the first bad one hides every later one behind it. Both have
+        happened on hardware: a switch the device ignores aborted the loop before the
+        next switch was tried, and a failing clamp check hid the narrowness probe behind
+        it. One run should name everything wrong with the table, not the first thing.
 
         The runner raises whatever accumulates here, so a check cannot record a failure
         and then pass by forgetting to look.
@@ -582,21 +571,19 @@ async def the_sleep_speed_is_refused_by_the_device(ctx: Context) -> None:
     """Check the measurement behind refusing speed 0, rather than the refusal.
 
     `the_sleep_speed_is_not_selectable` checks that the library says no. This checks
-    that the library is right to, which is the part that ships as a claim about the
-    hardware: commanded directly, speed 0 is acknowledged and then undone about five
-    seconds later.
+    that the library is right to, which is the claim about the hardware: commanded
+    directly, speed 0 is acknowledged and then undone a few seconds later.
 
     Sent raw, because the library refuses it — and raw sends apply nothing
-    optimistically, so whatever the state says afterwards is the device's own answer.
-    The last version of this measurement was taken with the unit off, where every speed
-    reverts, and the conclusion survived a re-run only by luck. Hence a check.
+    optimistically, so whatever the state says afterwards is the device's own answer. An
+    earlier version of this measurement was taken with the unit off, where every speed
+    reverts, so it was right by accident. Hence a check.
 
     Waited out rather than settled for, because the contradiction does not come in a
-    frame of its own. The device acknowledges 0, holds it, and then reports the real
-    speed on the back of the next ambient reading it was going to push anyway — 4.05s,
-    4.12s and 6.0s after the acknowledgement in three runs, against a settle that read
-    at 5.4s. Run 4 read 0, failed a true claim, and the very next check saw the revert
-    0.6s later. Two passes before it were luck, not evidence.
+    frame of its own: the device acknowledges 0, holds it, and then reports the real
+    speed on the back of the next ambient reading it was going to push anyway. That has
+    taken up to six seconds, which is longer than a settle, so a settle here passes or
+    fails on timing rather than on behaviour.
     """
     ctx.requires(Feature.FAN_SPEED)
     if SLEEP_FAN_SPEED in ctx.caps.fan_speeds:
@@ -754,14 +741,14 @@ async def sleep_is_refused_in_fan_mode(ctx: Context) -> None:
     the device's answer without anybody asking it to.
 
     Both READMEs used to extend that promise to EXTRA and eco, on the reasoning that all
-    three are cooling programmes. A live run refused it: on firmware 1.0.29 fan mode
-    accepted and kept both. Not unreasonable of it — EXTRA is the top of the fan
-    control and eco forces the bottom of it, and both of those mean something with no
-    compressor involved — but it does mean the grouping was a guess about the device's
-    reasoning rather than an observation. So only sleep is asserted here. What the other
-    two do is recorded, because a reader of this output deserves the number, and left
-    without a verdict, because nothing in this library depends on the answer and a
-    firmware that changed its mind either way would not be a bug in it.
+    three are cooling programmes. The device refuses it: fan mode accepts and keeps
+    both. Not unreasonable of it — EXTRA is the top of the fan control and eco forces
+    the bottom of it, and both of those mean something with no compressor involved — but
+    it does mean the grouping was a guess about the device's reasoning rather than an
+    observation. So only sleep is asserted here. What the other two do is recorded,
+    because a reader of this output deserves the number, and left without a verdict,
+    because nothing in this library depends on the answer and a firmware that changed
+    its mind either way would not be a bug in it.
     """
     ctx.requires_mode(Mode.FAN)
     was_mode = ctx.state.mode
@@ -809,35 +796,20 @@ async def the_off_state_keeps_the_fan_speed_it_was_given(ctx: Context) -> None:
     frames around the second, so a tool whose promise to put things back depends on an
     assumption should check the assumption.
 
-    **Both readings have to wait out the turn-off timer**, which is what the first two
-    versions of this check got wrong. The window unit takes about twenty seconds to
-    finish shutting down with the fan still running; those versions read at 5.5s and
-    again at 12.1s and powered the unit back on at 12.7s, so neither ever saw the unit
-    off, and nothing either of them concluded was usable.
-
-    **Measured properly on 2026-09-27, the answers are: no and yes.** Powered down at
-    speed 4, the unit reported 4 in three separate `cmd:3` replies at 21.1s, 31.1s and
-    31.7s after the power-off — past the timer, so not a fan spinning down. Speed 1 was
-    then written 32s after the power-off and read back as 1 at 53s, 63s and 64s. So the
-    fan does not park, and a setting written to a unit that is off does stick.
-
-    That is the third time these two claims have moved, so: what makes this reading
-    different from the two before it is that every value in it was taken outside the
-    shutdown window, and each of the two conclusions rests on three full reads rather
-    than one. A probe hours before the first live run had seen speeds written while off
-    revert to the slowest; that probe is presumed to have had the same defect, because
-    nothing in it recorded how long after the power-off it read.
-
-    The consequence for consumers is that the speed shown while the unit is off is the
-    setting and not a parked value, which is what `pyzafro`'s README and the
-    integration's now say.
+    **Both readings have to wait out the turn-off timer**, which earlier versions did
+    not. The window unit takes about twenty seconds to finish shutting down with the fan
+    still running, so anything read inside that window describes a shutdown and not an
+    off unit. Measured past it, the answers are no and yes: the fan does not park, so
+    the speed shown while off is the setting and not a parked value, and a setting
+    written to a unit that is off does stick. Every reading that said otherwise was
+    taken inside the shutdown.
 
     The speed written while off has to differ from the speed the unit is reporting by
     then, which is why it is chosen after the first reading rather than before it. An
     earlier version wrote the top speed to a unit sitting at the top speed, so the
     read-back was the same number whether the write landed or was thrown away — and
-    picking the slowest speed instead would have had the same problem the other way up
-    against a unit that parks.
+    picking the slowest instead has the same problem the other way up against a unit
+    that parks.
 
     Read from a `cmd:3` reply for the same reason the feature walk is: these are values
     the library sent and the device did not mention, so merged state would answer with
@@ -909,12 +881,11 @@ async def the_thermostat_verdict_is_withheld_while_the_unit_is_off(
 ) -> None:
     """Check that `reachtarget` while off is a placeholder and not an answer.
 
-    Found in the traces of two runs rather than looked for. With the setpoint and the
-    ambient reading identical on both sides of the transition — `templevel: 86`,
-    `temperature: 81` — the device reported `reachtarget: 1` running and `0` off, and it
-    pushed the change as a delta within 0.55s of each power command in all four
-    transitions across both runs. So the field is not stale while off and not the
-    comparison either: it is 0 because the unit is off.
+    Found in traces rather than looked for. With the setpoint and the ambient reading
+    identical on both sides of the transition, the device reported `reachtarget: 1`
+    running and `0` off, and pushed the change as a delta within a second of every power
+    command. So the field is not stale while off and not the comparison either: it is 0
+    because the unit is off.
 
     That matters to a consumer and not to this library. A binary sensor fed the raw
     field reads "not reached" whenever the air conditioner is idle, which is the same
@@ -927,9 +898,8 @@ async def the_thermostat_verdict_is_withheld_while_the_unit_is_off(
     satisfied. Nothing is moved across ambient here: the only thing that changes between
     the three readings is the power, which is what makes power the cause.
 
-    **Past the turn-off timer, like every other off-state reading.** A verdict taken at
-    0.55s would be describing a unit that is still shutting down, and that mistake has
-    already cost this suite two runs and four documentation edits.
+    **Past the turn-off timer, like every other off-state reading.** A verdict read
+    immediately after the power command describes a unit that is still shutting down.
     """
     if BinarySensorKey.REACHED_TARGET not in ctx.caps.binary_sensors:
         raise CheckSkippedError("model does not report reached_target")
@@ -1103,9 +1073,9 @@ async def every_claimed_feature_is_accepted(ctx: Context) -> None:
     Read back from a full re-read rather than from merged state. A device that ignores
     the key answers nothing at all, so the merged view holds the library's own
     optimistic write until the resync corrects it — which means reading merged state
-    tests this check's settle against RESYNC_DELAY rather than the device. A live run
-    caught an ignored `lighton` only because the default settle happens to be the longer
-    of the two; at `--settle 3` it would have passed a dud switch.
+    tests this check's settle against RESYNC_DELAY rather than the device. An ignored
+    `lighton` was caught on hardware only because the default settle happens to be the
+    longer of the two; at `--settle 3` it would have passed a dud switch.
     """
     switches: tuple[tuple[Feature, str, Callable[[bool], Awaitable[None]]], ...] = (
         (
@@ -1351,18 +1321,17 @@ async def some_assumptions_cannot_be_checked_at_all(ctx: Context) -> None:
     means pulling the plug out; and which louvre `oscset1` moves can only be settled by
     watching the unit. Both are jobs for a human standing next to it.
 
-    Whether the machine cools, and whether it removes water in dry mode, are the two
-    that went on this list after live runs, and both for the same reason. Each ambient
-    reading alternates between two adjacent integers about a second apart, so the noise
-    is twice the smallest change a check could look for. The humidity check failed
-    against a unit that was dehumidifying. The cooling check passed in 0.0 seconds on
-    one run, catching the reading on its way down from 83 to 81, and then failed after a
-    full three minutes on the next, same unit and same room. Whether `rh` and
-    `temperature` are the room rather than some reading inside the machine is
-    unanswerable for exactly the same reason.
+    Whether the machine cools, and whether it removes water in dry mode, went on this
+    list after both were tried against hardware and neither could be measured. Each
+    ambient reading alternates between two adjacent integers about a second apart, so
+    the noise is twice the smallest change a check could look for: the humidity version
+    failed against a unit that was dehumidifying, and the cooling version passed and
+    failed on consecutive runs in the same room. Whether `rh` and `temperature` are the
+    room at all, rather than some reading inside the machine, is unanswerable for the
+    same reason.
 
-    What this library actually claims about those two modes is which setpoint each one's
-    thermostat watches and in which direction, and both are tested without the room, in
+    What this library claims about those two modes is which setpoint each thermostat
+    watches and in which direction, and both are tested without the room, in
     `cool_mode_is_the_mode_that_cools` and
     `dry_mode_regulates_humidity_not_temperature`.
     """
@@ -1549,7 +1518,7 @@ async def base_info_reports_a_signal_strength(ctx: Context) -> None:
 # What it does not do is read the room. Every version of that was tried and none of it
 # worked: both ambient readings alternate between two adjacent integers about a second
 # apart, so the instrument's noise is twice the smallest change a check could look for,
-# and two runs of one check on one unit disagreed. What these mappings actually claim is
+# and consecutive runs of one check on one unit disagreed. What these mappings claim is
 # which setpoint a mode's thermostat compares against and in which direction, and the
 # MCU answers that in a second from two numbers it already holds. Whether the machine
 # cools or dries is a fact about somebody's appliance, and is reported as uncovered
@@ -1635,26 +1604,23 @@ async def cool_mode_is_the_mode_that_cools(ctx: Context) -> None:
     and nothing anywhere reports an error.
 
     What the claim amounts to is which setpoint this mode's thermostat watches and which
-    way round it watches it, and both are readable from `reachtarget` without waiting
-    for a room. The dry-mode check below closes the argument. It establishes that mode 2
-    ignores the temperature target entirely and watches `rhlevel`, so mode 1 is not the
-    dehumidify mode wearing cool's number; and it fixes the field's polarity, because a
-    unit with the room at 76% and a target of 30% read `reachtarget` 0, and an air
-    conditioner has no way to add water, so 0 is "not yet" and not "done". With the
-    polarity pinned, the direction is the whole
-    claim: a cooling thermostat is satisfied when the target sits above the room and
-    unsatisfied when it sits below, and a heating thermostat is exactly the other way
-    round. Which is what this check reads, twice, from either side of ambient.
+    way round, and both are readable from `reachtarget` without waiting for a room. The
+    dry-mode check below closes the argument: it establishes that mode 2 ignores the
+    temperature target entirely and watches `rhlevel`, so mode 1 is not the dehumidify
+    mode wearing cool's number, and it fixes the field's polarity, since a unit asked to
+    dry a room well above its humidity target reads 0 and an air conditioner has no way
+    to add water. With the polarity pinned, the direction is the whole claim: a cooling
+    thermostat is satisfied when the target sits above the room and unsatisfied when it
+    sits below, where a heating one is the other way round. Which is what this reads,
+    twice, from either side of ambient.
 
-    That is a change of instrument. This check used to set the setpoint to its floor,
-    put the fan flat out and wait up to three minutes for the room to fall, on the
-    argument that physical consequence was the only way to read a mode number. It is
-    not, and the room was a bad instrument for it: the ambient reading alternates
-    between two adjacent integers about a second apart, so the noise is twice the
-    smallest change the check could detect. One live run passed it in 0.0 seconds — it
-    caught the reading on the way down from 83 to 81 and credited the command with it —
-    and the next failed it after a full 180 seconds, on the same unit in the same room.
-    A stable baseline was tried first and does not help, because a reading that
+    That is a change of instrument. This used to set the setpoint to its floor, put the
+    fan flat out and wait up to three minutes for the room to fall, on the argument that
+    physical consequence was the only way to read a mode number. It is not, and the room
+    is a bad instrument for it: the ambient reading alternates between two adjacent
+    integers about a second apart, so the noise is twice the smallest detectable change,
+    and the old version passed and failed on consecutive runs against the same unit in
+    the same room. A stable baseline does not rescue it either, because a reading that
     alternates reads the same at both ends of a poll.
 
     Whether the machine actually removes heat is a different question, and not this
@@ -1727,8 +1693,8 @@ async def dry_mode_regulates_humidity_not_temperature(ctx: Context) -> None:
     something other than the two temperatures, and `rhlevel` is its only other
     setpoint — so it reads the number this library sends, and dry is where it matters.
 
-    This began as a three-minute wait for `rh` to fall, the wrong instrument, and a
-    live run showed why: the reading flaps between two adjacent integers continuously,
+    This began as a three-minute wait for `rh` to fall, the wrong instrument, and the
+    hardware showed why: the reading flaps between two adjacent integers continuously,
     so the noise band is as large as the change being looked for, and a room reloads
     humidity while a unit removes it. It failed against a working unit. What survives of
     that question is in `some_assumptions_cannot_be_checked_at_all`; what is in scope is
@@ -1816,20 +1782,19 @@ async def the_runtime_counter_is_monotonic(ctx: Context) -> None:
     bug here, in the sensor definition, whatever the hardware is doing.
 
     **The window is the whole run, and it costs nothing.** This check used to sit
-    through a three-minute soak of its own waiting for a tick. Two live runs gave it
-    one: both times the counter did not move, both times it skipped, and six minutes
-    went into establishing nothing. Comparing against the state the run found gives
-    about thirteen minutes of window instead of three, for no wait at all — and thirteen
-    is long enough to be worth something. A counter in seconds would have moved by
-    roughly eight hundred and one in minutes by about thirteen, where the three-minute
-    version could not tell "minutes, and the tick was just missed" from "hours".
+    through a three-minute soak of its own waiting for a tick, which never came and
+    never could. Comparing against the state the run found gives about thirteen minutes
+    of window instead of three, for no wait at all, and thirteen is long enough to be
+    worth something: a counter in seconds would have moved by hundreds and one in
+    minutes by about thirteen, where three minutes could not tell "minutes, and the tick
+    was just missed" from "hours".
 
     So no movement over a whole run rules out seconds and minutes properly, and leaves
     the hours this library ships it in — a guess drawn from `filterthr` reading 600
     beside it, which is a filter reminder in hours if it is anything. Still not a
     confirmation, and not recorded as one. What would confirm it is two runs a few days
-    apart, which is what `-o` is for: `worktime` read 2 on 2026-09-13 and 17 on
-    2026-09-27. No single run can see that, however long it waits.
+    apart, which is what `-o` is for; the counter has been seen to step across that kind
+    of gap. No single run can see it, however long it waits.
     """
     if SensorKey.WORK_TIME not in ctx.caps.sensors:
         raise CheckSkippedError("model does not report a runtime counter")
@@ -2097,15 +2062,15 @@ class SelfTest:
         through is worse than not trying.
 
         **The mode is parked here too**, and that is the point of parking anything here.
-        Three thermal checks skip unless they are handed cool mode, and for two runs it
-        was handed to them by luck: the liveness check that sends two conflicting
-        commands and keeps whichever the device answered with sends two *modes*, so the
-        mode the suite left behind was the outcome of a race. Run 2 happened to leave
-        cool and the checks ran; run 3 left dry and all three skipped, reporting nothing
-        about the claim they exist for. A precondition that a *later* check needs must
-        not depend on what an *earlier* one happened to leave, so it is established
-        between checks rather than hoped for — the same argument that put the setpoint
-        park here, one field over.
+        Three thermal checks skip unless they are handed cool mode, and it used to be
+        handed to them by luck: the liveness check that sends two conflicting commands
+        and keeps whichever the device answered with sends two *modes*, so the mode the
+        suite left behind was the outcome of a race. When it came out cool the checks
+        ran; when it came out dry all three skipped, reporting nothing about the claim
+        they exist for. A precondition that a *later* check needs must not depend on
+        what an *earlier* one happened to leave, so it is established between checks
+        rather than hoped for — the same argument that put the setpoint park here, one
+        field over.
         """
         state = self.device.state
         caps = self.device.capabilities
@@ -2165,9 +2130,8 @@ class SelfTest:
         Settings first and power last when the unit was found off, so that the last
         frame is the one that leaves it off and the unit is never briefly running when
         it was found idle. The original reason was that a unit which is off does not
-        keep what it is told, which turned out to be false — a speed written 32s after
-        a power-off read back unchanged 31s later — but the order is still the one that
-        hands the unit back the way it was found, so it stays.
+        keep what it is told, which turned out to be false, but the order is still the
+        one that hands the unit back the way it was found, so it stays.
 
         Then it reads the device again and says what did not come back. The promise to
         put the unit back is the one this tool makes to the person who agreed to let it

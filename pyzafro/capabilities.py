@@ -159,11 +159,11 @@ class Capabilities:
         So the ranges and the mode list only ever narrow, while the features, switches
         and sensors are rebuilt from what was seen and can come out either way. That
         second half rests on an inference this library now knows to be unsound in one
-        direction: a live run found `90038EAC0-12K-ZAZ` reporting `lighton` and ignoring
-        every command to it, so a reported field is not proof of a working control. It
-        is kept because for an unknown model it is the only evidence there is, and a
-        catalogued model never comes through here — but it is why a model that has been
-        characterised gets a hand-written entry rather than this.
+        direction: `90038EAC0-12K-ZAZ` reports `lighton` and ignores every command to
+        it, so a reported field is not proof of a working control. It is kept because
+        for an unknown model it is the only evidence there is, and a catalogued model
+        never comes through here — but it is why a model that has been characterised
+        gets a hand-written entry rather than this.
         """
         seen = set(observed)
         return Capabilities(

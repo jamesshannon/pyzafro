@@ -111,12 +111,12 @@ so it is absent from `fan_speeds`: `sleep` is the way to that speed.
 
 The undoing is worth a word, because it is not how this device turns anything else down.
 A value the unit means to refuse comes back corrected in the frame right after the
-acknowledgement — half a second, every time, in four runs. Speed `0` is not refused: it
-is stored, reported back as the current speed, and then quietly replaced by the speed the
-fan is really running, riding the next ambient reading the unit was going to push anyway.
-That took 4.05s, 4.12s and 6.0s across three runs, on nobody's schedule. So a consumer
-that reads the speed straight after writing one can see a `0` that is about to stop being
-true, and anything asserting the device does not keep it has to wait rather than sleep.
+acknowledgement, within a second. Speed `0` is not refused: it is stored, reported back as
+the current speed, and then quietly replaced by the speed the fan is really running,
+riding the next ambient reading the unit was going to push anyway — several seconds later,
+on nobody's schedule. So a consumer that reads the speed straight after writing one can
+see a `0` that is about to stop being true, and anything asserting the device does not
+keep it has to wait for the replacement rather than sleep and look once.
 
 ## The diagnostic tool
 
@@ -188,8 +188,7 @@ for more than a settle. `thermal` is all of the electricity and a third of the c
 three of its four checks wait on the MCU to compare two numbers it already holds, and give
 up after a minute; the fourth waits for nothing at all. Every wait ends the moment the unit
 has answered, so the printed estimate is a ceiling and a healthy unit finishes well inside
-it. The last full run took under fifteen minutes and two three-minute waits have come out
-of it since.
+it — around ten minutes against a ceiling of about seventeen.
 
 **It runs the machine.** It prints what it will change, asks before starting, and restores
 every field afterwards — including after a failure or a Ctrl-C — then re-reads the device
@@ -242,23 +241,21 @@ ambient settles it.
 Both of those replaced a three-minute wait for the room to move, and both waits were wrong
 for the same reason. Each ambient reading alternates between two adjacent integers about a
 second apart, so the instrument's noise is twice the smallest change either check could
-look for. The humidity version failed against a unit that was dehumidifying. The cooling
-version passed in 0.0 seconds on one live run, having caught the reading on its way down
-from 83 to 81, and then failed after the full three minutes on the next — same unit, same
-room, same firmware. Watching for a stable baseline first does not rescue it, because a
-reading that alternates reads the same at both ends of a poll.
+look for. The humidity version failed against a unit that was dehumidifying; the cooling
+version passed and failed on consecutive runs against the same unit in the same room,
+having once caught the reading on its way down and credited the command with it. Watching
+for a stable baseline first does not rescue it, because a reading that alternates reads the
+same at both ends of a poll.
 
 So whether the machine removes any heat or any water is not something this suite answers.
 It is on the uncovered list below, with the reason.
 
 The runtime counter is the third case and fails differently: the instrument is exact and
 the timescale is wrong. `worktime` moves in hours, so a three-minute wait could never see
-it — both live runs sat through the whole deadline and skipped, which is six minutes spent
-establishing nothing. It compares against the state the run found instead: a window four
-times longer for no wait at all, and long enough to tell "minutes, and the tick was just
-missed" from "hours". What would actually settle the units is two runs a few days apart,
-which is one of the things `-o` is for — `worktime` read 2 on 2026-09-13 and 17 on
-2026-09-27, and no single run can see that however long it waits.
+it and never did. It compares against the state the run found instead: a window four times
+longer for no wait at all, and long enough to tell "minutes, and the tick was just missed"
+from "hours". What would actually settle the units is two runs a few days apart, which is
+one of the things `-o` is for; no single run can see it however long it waits.
 
 Every check reports what it measured, pass or fail, because pinning down a number the
 table only guesses at is half the reason to run it — including how long the machine took,
@@ -276,44 +273,38 @@ which is how `worktime`'s units get established at all:
         setpoint_60_became = 61
 ```
 
-That second one is from the first live run, and is what the table now says. It moved four
-numbers: the setpoint floor from 60 to 61, the humidity ceiling from 80 to 70, and the
-display light off the window unit's feature list entirely — it reports `lighton` and
-ignores every command to it, so the switch built from that field did nothing. Both READMEs
-lost a claim too: fan mode turns down sleep, but accepts Extra and eco.
+That second one came from hardware, and is what the table now says. Running this against a
+real unit moved four numbers — the setpoint floor from 60 to 61, the humidity ceiling from
+80 to 70, and the display light off the window unit's feature list entirely, because it
+reports `lighton` and ignores every command to it, so the switch built from that field did
+nothing. Both READMEs lost a claim too: fan mode turns down sleep, but accepts Extra and
+eco.
 
-The second run, with those four corrections in, passed 34 of 38 and left two failures that
-were both bugs in this suite rather than in the library: the cooling check described above,
-and an off-state check that wrote the fan speed the unit was already at and treated the
-read-back as evidence. Which is the other thing a rare, thorough run buys — the checks get
-audited by the hardware they audit.
+The other thing a rare, thorough run buys is that **the checks get audited by the hardware
+they audit**, and several were wrong:
 
-A third thing the runs found, and neither of them noticed, is that this unit takes about
-twenty seconds to finish switching off, with the fan running for all of it. The off-state
-check read at 5.5 seconds and again at 12.1, and powered the unit back on at 12.7, so it
-never saw the unit off; both of its conclusions were about a fan that had not stopped yet,
-and one of them had reached both READMEs before the timer came up. A check that reads a
-state the device takes time to reach has to be told how long that is — the deadline is not
-always the one you were thinking about.
+- The cooling check described above, which the room could not answer.
+- An off-state check that wrote the fan speed the unit was already at, so its read-back was
+  the same number whether the write landed or not.
+- Every early off-state reading, because this unit takes about twenty seconds to finish
+  switching off with the fan running for all of it. Those checks read the state and powered
+  the unit back on well inside that window, so they never saw the unit off, and one of their
+  conclusions reached both READMEs before the timer came up. A check that reads a state the
+  device takes time to reach has to be told how long that is — the deadline is not always
+  the one you were thinking about.
+- A check that read back its own optimistic write and called it the device's answer.
 
-The third run waited past the timer, and the answers are **no and yes**: powered down at
-speed 4 the unit reported 4 in three full reads from 21.1 seconds onwards, and a speed
-written 32 seconds after the power-off read back unchanged 31 seconds later. So the fan
-does not park, the speed shown while the unit is off is the setting rather than a parked
-value, and a setting written to a unit that is off is kept.
+Measured past the turn-off timer: **the fan does not park**, so the speed shown while the
+unit is off is the setting rather than a parked value, and **a setting written to a unit
+that is off is kept**. Earlier readings said otherwise and were all taken inside the
+shutdown.
 
-Those two claims have now moved three times, so what makes this reading the one to trust is
-worth stating: every value in it was taken outside the shutdown window, and each conclusion
-rests on three `cmd:3` full reads rather than one. A probe before the first run had seen
-speeds written while off revert to the slowest; it recorded no timing, so it is presumed to
-have had the same defect.
-
-The same run found a fourth thing, which is a bug in the suite's shape rather than in a
-check. Three of the four thermal checks skip unless they are handed cool mode, and nothing
-was establishing it: the liveness check that sends two conflicting commands and keeps
-whichever the device answered with sends two *modes*, so the mode left behind was the
-outcome of a race. Run 2 left cool and all three ran; run 3 left dry and all three skipped.
-The between-check reset parks the mode now, beside the setpoint it already parked. A
+The last thing hardware found is a bug in the suite's shape rather than in a check. Three
+of the four thermal checks skip unless they are handed cool mode, and nothing was
+establishing it: the liveness check that sends two conflicting commands and keeps whichever
+the device answered with sends two *modes*, so the mode left behind was the outcome of a
+race. When it came out cool all three ran; when it came out dry all three skipped. The
+between-check reset parks the mode now, beside the setpoint it already parked. A
 precondition a later check needs cannot be left to what an earlier one happened to do.
 
 Two checks deliberately bypass validation, and only these two: the setpoint and humidity
@@ -321,12 +312,13 @@ ranges are probed one step past each end with a raw frame. Every other check can
 range that is too *wide*, because the library offers a value and the device clamps it.
 None can find one that is too narrow, because the library refuses out-of-range values
 before they reach the wire — so a unit happily accepting 58 would never be asked, and its
-owner would simply never be offered a setting their hardware has. The first live run found
-the shipped range wrong in both directions at once, which is the argument for both halves.
+owner would simply never be offered a setting their hardware has. Hardware found the
+shipped range wrong in both directions at once, which is the argument for both halves.
 
 A check that walks a list — every claimed feature, both ends of a range — reports every
-item, not the first bad one. That run stopped at a display switch the device ignores and so
-never tested the beeper, and failed a humidity bound before reaching the probe behind it.
+item, not the first bad one. Both failure modes have happened: a run stopped at a display
+switch the device ignores and so never tested the beeper, and a failing humidity bound hid
+the probe behind it.
 
 What a passing run still does not cover is stated rather than implied: the Celsius mapping
 (`tempunit` is read-only), the fault-code vocabulary and the water and filter readings

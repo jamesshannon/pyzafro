@@ -73,7 +73,7 @@ _OFF_SPEED = 1
 
 
 class FakeUnit:
-    """A window air conditioner, as measured on 2026-09-27.
+    """A window air conditioner, as measured against the real thing.
 
     Applies a frame's keys **in the order they appear**, because that is what the real
     one does and it is the whole subject of the fix these checks protect. Entering sleep
@@ -91,8 +91,8 @@ class FakeUnit:
         deferred_restore: bool = False,
         minimal: bool = False,
         model: str = RAW["model"],
-        # What the device really accepts, defaulting to what the table now claims after
-        # a live run tightened it. A fake whose real limits are wider than the table's
+        # What the device really accepts, defaulting to what the table claims now that
+        # hardware has tightened it. A fake whose real limits are wider than the table's
         # is a fake reporting the table too narrow, which is a finding, not a baseline.
         real_temp_range: tuple[int, int] = (61, 86),
         real_humidity_range: tuple[int, int] = (30, 70),
@@ -143,21 +143,20 @@ class FakeUnit:
         self.holds_speed_zero = holds_speed_zero
         #: How many full reads it takes for speed 0 to come undone. The window unit
         #: stores the 0, keeps reporting it, and lets the truth ride the next ambient
-        #: reading it was going to push anyway — 4.05s, 4.12s and 6.0s after the
-        #: acknowledgement across three runs — so one read is the default, because the
-        #: default unit is the one the hardware is. Zero instead corrects it in the
-        #: frame after the acknowledgement, the way a programme this unit means to
-        #: refuse comes back at 0.54s, which is the shape a settle can see.
+        #: reading it was going to push anyway, several seconds later — so one read is
+        #: the default, because the default unit is the one the hardware is. Zero
+        #: instead corrects it in the frame after the acknowledgement, the way a
+        #: programme this unit means to refuse does, which a settle can see.
         self.reverts_speed_zero_after_reads = reverts_speed_zero_after_reads
         self._undoing: tuple[int, Any] | None = None
         #: Whether a write to a unit that is off is kept. The window unit keeps it: a
-        #: speed written 32s after a power-off read back unchanged 31s later. Both
-        #: defaults here were the other way up until run 3 measured them past the
-        #: turn-off timer, which is why the default unit is the one that passes.
+        #: speed written well after a power-off reads back unchanged. This default and
+        #: the next were the other way up until both were measured past the turn-off
+        #: timer, which is why the default unit is the one that passes.
         self.keeps_settings_while_off = keeps_settings_while_off
         #: Whether powering down drops the fan to its slowest speed. The window unit
-        #: does not: powered down at speed 4 it reported 4 in three full reads from
-        #: 21.1s onwards, so the speed shown while off is the setting.
+        #: does not: powered down at its top speed it kept reporting that speed in every
+        #: read past the turn-off timer, so the speed shown while off is the setting.
         self.parks_fan_when_off = parks_fan_when_off
         #: How many full reads a power-down takes before the fan parks, which is what
         #: the window unit's twenty-second turn-off timer looks like to a check that
@@ -404,9 +403,9 @@ class FakeUnit:
             return
         if not self.wire["poweron"] and not self.judges_while_off:
             # A unit that is off reports no verdict, whatever the setpoint says. Seen
-            # across four power transitions in two live runs with `templevel` and
-            # `temperature` unchanged either side: 1 running, 0 off, pushed as a delta
-            # within 0.55s of each power command.
+            # across every observed power transition with the setpoint and the ambient
+            # reading unchanged either side: 1 running, 0 off, pushed as a delta within
+            # a second of the power command.
             if self.wire["reachtarget"]:
                 self._move("reachtarget", value=False)
             return
@@ -572,15 +571,13 @@ async def test_the_sleep_exit_check_would_have_caught_the_shipped_bug(monkeypatc
 
 
 async def test_a_unit_that_takes_its_time_undoing_speed_zero_is_not_failed_for_it():
-    """Run 4's only failure: a true claim, read six tenths of a second too early.
+    """A true claim, once failed on hardware by reading the state a moment too early.
 
     The device does not refuse speed 0 the way it refuses a programme. A refusal comes
-    back in the frame after the acknowledgement, at 0.54s in every run. This does not
-    come back at all: the 0 is stored, reported, and then quietly replaced on the next
-    ambient reading the unit was going to push anyway. Three runs measured 4.05s, 4.12s
-    and 6.0s against a settle reading the state at 5.4s, so the two passes before run 4
-    were luck and the failure was the check rather than the device — the very next check
-    saw the revert arrive.
+    back in the frame after the acknowledgement, within a second, every time. This does
+    not come back at all: the 0 is stored, reported, and then quietly replaced on the
+    next ambient reading the unit was going to push anyway. That has taken longer than a
+    settle, so a settle decided this on timing and happened to be right twice.
 
     The default unit takes a read to undo it, so this is also what the baseline covers;
     named separately because the thing being asserted is that patience is not optional.
@@ -884,7 +881,7 @@ async def test_a_unit_that_keeps_sleep_in_fan_mode_is_a_failure():
 
 
 async def test_extra_and_eco_in_fan_mode_are_recorded_without_a_verdict():
-    """A live run found fan mode keeping both, and nothing here depends on the answer.
+    """The device keeps both in fan mode, and nothing here depends on the answer.
 
     They used to be asserted alongside sleep on the reasoning that all three are cooling
     programmes. That was a guess about the device's reasoning, the device disagreed, and
@@ -947,13 +944,13 @@ async def test_a_power_down_that_takes_its_time_is_waited_out():
     """The window unit runs a turn-off timer of about twenty seconds.
 
     The fan is still going for all of it, so a reading taken inside that window is of a
-    unit shutting down and not of a unit that is off. The live run read at 5.5s and then
-    at 12.1s and powered the unit back on at 12.7s, and reported a unit that does not
-    park its fan — from a fan that had not finished stopping.
+    unit shutting down and not of a unit that is off. Earlier versions of the check read
+    twice and powered the unit back on well inside the timer, and reported a unit that
+    does not park its fan — from a fan that had not finished stopping.
 
     This fake parks on its second read, so a check that looked once would report exactly
-    what those runs reported, and be wrong for exactly their reason. Waiting the window
-    out finds the park, which for this claim is a failure.
+    that, and be wrong for exactly that reason. Waiting the window out finds the park,
+    which for this claim is a failure.
     """
     assert POWER_DOWN > 20.0
     _, results = await _run(FakeUnit(parks_after_reads=1, parks_fan_when_off=True))
@@ -1014,8 +1011,8 @@ async def test_a_range_the_device_exceeds_is_reported_as_too_narrow():
 
     A unit that accepts 60 would never be asked for it, so its owner would simply never
     be offered a setting their hardware has. Only a raw frame can find that — and the
-    live run vindicated it from the other side: the table claimed 60, the device clamped
-    that to 61, so one guess was wrong in both directions at once.
+    hardware vindicated it from the other side: the table claimed a floor the device
+    clamped, so one guess was wrong in both directions at once.
     """
     _, results = await _run(FakeUnit(real_temp_range=(50, 90)))
     narrow = _one(results, "the_setpoint_range_is_not_too_narrow")
@@ -1131,9 +1128,9 @@ async def test_a_mode_number_that_may_be_mislabelled_is_a_failure():
 async def test_the_cool_check_reads_the_thermostat_and_not_the_room():
     """It used to wait three minutes for the room to fall, which cannot be measured.
 
-    The ambient reading alternates between two adjacent integers, so two live runs of
-    that version disagreed on the same unit in the same room: a pass in 0.0 seconds off
-    a reading on its way down, then a failure after the whole wait. What the mapping
+    The ambient reading alternates between two adjacent integers, so consecutive runs of
+    that version disagreed on the same unit in the same room: an instant pass off a
+    reading on its way down, then a failure after the whole wait. What the mapping
     claims is which way round the thermostat is satisfied, which the MCU answers at
     once — so the check is budgeted a `reaches` deadline and never reads
     `ambient_temperature` for a verdict. There is no room-waiting budget to carry
@@ -1242,9 +1239,9 @@ async def test_the_runtime_check_is_about_the_state_class_not_the_appliance():
 
 
 async def test_the_runtime_window_is_the_whole_run_and_costs_nothing():
-    """It used to soak for three minutes of its own and learn nothing, twice.
+    """It used to soak for three minutes of its own and learn nothing.
 
-    The counter did not move in either live run, so six minutes bought two skips. The
+    The counter never moved in that window, so the wait bought a skip every time. The
     state the run found is a window four times longer for no wait at all, which is also
     long enough to tell "minutes, and the tick was just missed" from "hours".
     """
@@ -1361,15 +1358,15 @@ async def test_a_write_the_device_never_answers_leaves_a_field_pending():
     assert noop.measured["pending_after_a_no_op"] == ["mute"]
 
 
-# --- what a live run found the checks themselves getting wrong ----------------------
+# --- what hardware found the checks themselves getting wrong ------------------------
 
 
 async def test_a_dud_switch_does_not_hide_the_switches_behind_it():
-    """A live run stopped at the first bad feature and never reached the rest.
+    """On hardware this stopped at the first bad feature and never reached the rest.
 
     The table claimed a display switch the device ignores; the check aborted there, so
-    mute went untested and the run could not say whether it worked. One run
-    should name everything wrong with the table, not the first thing.
+    mute went untested and the run could not say whether it worked. One run should name
+    everything wrong with the table, not the first thing.
     """
     _, results = await _run(FakeUnit(ignores=("muteon", "childlockon")))
     features = _one(results, "every_claimed_feature_is_accepted")
@@ -1424,7 +1421,7 @@ async def test_a_deferred_failure_outranks_a_later_skip():
 
 
 async def test_the_off_state_check_asks_the_device_rather_than_its_own_optimism():
-    """A live run read back its own optimistic write and called it the device's answer.
+    """An earlier version read back its own write and called it the device's answer.
 
     Both halves are about a value the library sent and the device did not mention, so
     the merged state is this library quoting itself. Only a full re-read can settle it.
@@ -1467,9 +1464,9 @@ async def test_a_check_cannot_strand_a_later_one_in_the_wrong_mode(left_in: Mode
 
     The liveness check that sends two conflicting commands and keeps whichever the
     device answered with sends two *modes*, so the mode the suite left behind was the
-    outcome of a race. Run 2 left cool and all three ran; run 3 left dry and all three
-    skipped, reporting nothing about the claims they exist for — the suite lost a
-    quarter of its thermal coverage to the order two frames happened to arrive in.
+    outcome of a race. When it came out cool all three ran; when it came out dry all
+    three skipped, reporting nothing about the claims they exist for — a quarter of the
+    thermal coverage lost to the order two frames happened to arrive in.
 
     So the mode is established between checks rather than hoped for, beside the
     park that is there for the same reason. Asserted for every mode a check could leave
