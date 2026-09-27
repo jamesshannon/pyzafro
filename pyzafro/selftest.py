@@ -817,6 +817,90 @@ async def the_off_state_keeps_the_fan_speed_it_was_given(ctx: Context) -> None:
             await ctx.command(ctx.device.async_set_power(on=True))
 
 
+# Budgeted a `reaches` for the power-down window, on the same argument as the check
+# above: the window is 25s and one `reaches` is 60s, and over-promising the clock is the
+# safe direction.
+@_check(
+    "protocol",
+    "A unit that is off reports no thermostat verdict, whatever the setpoint says",
+    cost=3,
+    reaches=1,
+)
+async def the_thermostat_verdict_is_withheld_while_the_unit_is_off(
+    ctx: Context,
+) -> None:
+    """Check that `reachtarget` while off is a placeholder and not an answer.
+
+    Found in the traces of two runs rather than looked for. With the setpoint and the
+    ambient reading identical on both sides of the transition — `templevel: 86`,
+    `temperature: 81` — the device reported `reachtarget: 1` running and `0` off, and it
+    pushed the change as a delta within 0.55s of each power command in all four
+    transitions across both runs. So the field is not stale while off and not the
+    comparison either: it is 0 because the unit is off.
+
+    That matters to a consumer and not to this library. A binary sensor fed the raw
+    field reads "not reached" whenever the air conditioner is idle, which is the same
+    reading as "running, still working towards it". Anyone automating on the negative
+    gets it every time the unit is off. So the integration reports unknown while the
+    unit is off, and this is the claim that entitles it to.
+
+    The setpoint is deliberately left where `_neutralise` parked it — the top of the
+    range, above any room this check will run in, which is the combination that reads
+    satisfied. Nothing is moved across ambient here: the only thing that changes between
+    the three readings is the power, which is what makes power the cause.
+
+    **Past the turn-off timer, like every other off-state reading.** A verdict taken at
+    0.55s would be describing a unit that is still shutting down, and that mistake has
+    already cost this suite two runs and four documentation edits.
+    """
+    if BinarySensorKey.REACHED_TARGET not in ctx.caps.binary_sensors:
+        raise CheckSkippedError("model does not report reached_target")
+    if ctx.state.mode is not Mode.COOL:
+        raise CheckSkippedError("this needs cool mode, where the comparator is known")
+    _low, high = ctx.temperature_bounds()
+    window = min(POWER_DOWN, ctx.max_wait_seconds)
+    was_power = ctx.state.power
+    await ctx.command(ctx.device.async_set_target_temperature(high))
+    running = (await ctx.confirmed()).reached_target
+    if running is not True:
+        raise CheckSkippedError(
+            f"the unit does not call itself satisfied at {high} with the room at "
+            f"{ctx.state.ambient_temperature}, so switching off cannot change anything"
+        )
+    try:
+        await ctx.command(ctx.device.async_set_power(on=False))
+        # A pass is this never becoming true again, so the window has to be spent in
+        # full: "it stayed 0" is only sayable once the deadline has passed.
+        lit = await ctx.until(lambda: ctx.state.reached_target is True, timeout=window)
+        off = (await ctx.confirmed()).reached_target
+    finally:
+        if was_power:
+            await ctx.command(ctx.device.async_set_power(on=True))
+    back = (await ctx.confirmed()).reached_target if was_power else None
+    ctx.note(
+        setpoint_held_throughout=high,
+        reached_target_running=running,
+        reached_target_while_off=off,
+        reached_target_powered_back_on=back,
+        seconds_before_it_read_satisfied_again=lit and round(lit, 1),
+        power_down_window=round(window, 1),
+    )
+    ctx.expect_but_continue(
+        off is False,
+        f"the setpoint stayed at {high} and the unit reported {running} running and "
+        f"{off} with the power off {window:.0f}s later, past the turn-off timer. If "
+        f"the verdict survives a power-down then it is the comparison after all, and "
+        f"the integration should report it while off rather than unknown",
+    )
+    if was_power:
+        ctx.expect_but_continue(
+            back is True,
+            f"the verdict was {running} before the power-down and {back} after coming "
+            f"back on, with the setpoint untouched at {high}: something other than the "
+            f"power decided it, so this check is not measuring what it claims",
+        )
+
+
 @_check("protocol", "A read-only field cannot be commanded", cost=0)
 async def a_read_only_field_is_refused(ctx: Context) -> None:
     """Check that the library will not try to write what the device only reports.

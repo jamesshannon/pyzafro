@@ -102,6 +102,7 @@ class FakeUnit:
         cools: bool = True,
         regulates_humidity: bool = True,
         tracks_target: bool = True,
+        judges_while_off: bool = False,
         runtime_step: int = 1,
         holds_speed_zero: bool = False,
         keeps_settings_while_off: bool = True,
@@ -133,6 +134,10 @@ class FakeUnit:
         self.cools = cools
         self.regulates_humidity = regulates_humidity
         self.tracks_target = tracks_target
+        #: Whether the thermostat's verdict survives a power-down. The window unit's
+        #: does not, so a consumer cannot tell "off" from "still working on it" without
+        #: reading the power, and the integration reports unknown while off.
+        self.judges_while_off = judges_while_off
         self.runtime_step = runtime_step
         self.holds_speed_zero = holds_speed_zero
         #: Whether a write to a unit that is off is kept. The window unit keeps it: a
@@ -359,6 +364,14 @@ class FakeUnit:
         if "reachtarget" not in self.wire:
             return
         if not self.tracks_target:
+            return
+        if not self.wire["poweron"] and not self.judges_while_off:
+            # A unit that is off reports no verdict, whatever the setpoint says. Seen
+            # across four power transitions in two live runs with `templevel` and
+            # `temperature` unchanged either side: 1 running, 0 off, pushed as a delta
+            # within 0.55s of each power command.
+            if self.wire["reachtarget"]:
+                self._move("reachtarget", value=False)
             return
         # Which setpoint the thermostat watches depends on the mode, which is the live
         # unit's behaviour and the evidence that dry mode is the humidity mode: the
@@ -1419,3 +1432,42 @@ async def test_the_between_check_reset_parks_the_setpoint_from_any_mode():
     device.close()
     assert device.state.mode is Mode.COOL
     assert device.state.target_temperature == high
+
+
+async def test_a_unit_that_keeps_judging_while_off_is_reported():
+    """The integration reports unknown while off, on the strength of this check.
+
+    A binary sensor fed the raw field reads "not reached" whenever the unit is idle,
+    which is the same reading as "running and still working towards it" — so anyone
+    automating on the negative gets it every time the unit is off. Suppressing the value
+    is only honest if the device really does withhold it, and firmware that answers the
+    comparison while off would make the suppression a lie rather than a kindness.
+    """
+    _, results = await _run(FakeUnit(judges_while_off=True))
+    verdict = _one(results, "the_thermostat_verdict_is_withheld_while_the_unit_is_off")
+    assert verdict.outcome == "fail"
+    assert "then it is the comparison after all" in verdict.detail
+    assert verdict.measured["reached_target_while_off"] is True
+
+
+async def test_the_withheld_verdict_is_read_with_the_setpoint_held_still():
+    """Moving the setpoint as well would leave two candidates for the cause.
+
+    The live traces got their force from `templevel` and `temperature` being identical
+    on both sides of the transition, so the power was the only thing that changed. A
+    check that swept the setpoint at the same time would prove nothing the existing
+    `reached_target_follows_the_setpoint` does not.
+    """
+    _, results = await _run(FakeUnit())
+    verdict = _one(results, "the_thermostat_verdict_is_withheld_while_the_unit_is_off")
+    assert verdict.outcome == "pass"
+    held = verdict.measured["setpoint_held_throughout"]
+    assert verdict.measured["reached_target_running"] is True
+    assert verdict.measured["reached_target_while_off"] is False
+    assert verdict.measured["reached_target_powered_back_on"] is True
+    setpoints = [
+        frame["result"]["templevel"]
+        for frame in verdict.trace
+        if "templevel" in frame["result"]
+    ]
+    assert set(setpoints) == {held}
