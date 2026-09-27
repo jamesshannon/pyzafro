@@ -163,8 +163,8 @@ where the bugs have actually been.
 
 This is the full integration suite, not a smoke test. It is meant to be run rarely and
 deliberately — once before a release, or after a bug that got past the unit tests — and it
-is thorough in preference to quick or gentle. Twenty minutes at worst, usually much
-less, and it runs the machine.
+is thorough in preference to quick or gentle. Fifteen minutes at worst, usually eleven
+or twelve, and it runs the machine.
 
 | suite | checks | what it exercises |
 |---|---|---|
@@ -172,14 +172,15 @@ less, and it runs the machine.
 | `protocol` | 8 | the changes the device makes that nobody asked for |
 | `capabilities` | 11 | whether the table still describes this device, and whether its ranges are real |
 | `liveness` | 6 | the assumptions optimistic writes rest on |
-| `thermal` | 4 | the mappings that cannot be read without letting the unit run |
+| `thermal` | 4 | the mode mappings, which only a running unit's thermostat can answer |
 
 Selectable and repeatable with `--suite`, all of them by default. The first four take
-about twelve minutes between them and never leave the thermostat unsatisfied for more than
-a settle. `thermal` is all of the electricity and most of the clock: each of its waits ends
-the moment the unit has responded, and gives up either after `--soak` (three minutes) or
-after a minute where what it is waiting for is the MCU comparing two numbers it already
-has. So the printed estimate is a ceiling, and a healthy unit finishes well inside it.
+about eight minutes between them and never leave the thermostat unsatisfied for more than
+a settle. `thermal` is all of the electricity and about half the clock. One of its waits
+is on the runtime counter and gives up after `--soak` (three minutes); the other three are
+waiting on the MCU to compare two numbers it already holds, and give up after a minute.
+Every wait ends the moment the unit has answered, so the printed estimate is a ceiling and
+a healthy unit finishes well inside it — the last full run took under twelve.
 
 **It runs the machine.** It prints what it will change, asks before starting, and restores
 every field afterwards — including after a failure or a Ctrl-C — then re-reads the device
@@ -197,24 +198,40 @@ other suite arranges.
 would pass with the enum shuffled: commanding mode 1 and reading mode 1 back proves the
 device accepts the number, never that the number means cooling. `Mode` labels the entire
 HVAC dropdown, so a mislabelled member puts "Cool" on the button that dehumidifies and
-nothing reports an error. For cool the only instrument is the direction the room moves.
-Likewise `reachtarget`, which gets a binary sensor named after a behaviour nobody has
-watched it perform, and `worktime`, which ships as `total_increasing` — a promise this
-library makes on the device's behalf that Home Assistant will read a decrease as a meter
-reset.
+nothing reports an error. Likewise `reachtarget`, which gets a binary sensor named after a
+behaviour nobody has watched it perform, and `worktime`, which ships as `total_increasing`
+— a promise this library makes on the device's behalf that Home Assistant will read a
+decrease as a meter reset.
 
-Where a physical consequence is the only available instrument, a check reads it and says so.
-Where it cannot tell a wrong mapping from a unit that simply is not cooling, it names both
-and says which one is in scope.
+**The room is not the instrument.** Both mode checks read the thermostat instead, because
+what a mode number actually claims is which setpoint that mode's thermostat compares
+against and in which direction, and the MCU answers that in about a second from two
+numbers it already holds.
 
-Where something better exists, it is used instead. Dry mode is read off the thermostat
-rather than the room: park the temperature setpoint where the unit calls itself satisfied,
-change nothing about it, and switch to dry with a humidity target below ambient. If
-`reachtarget` goes out, the device is comparing something other than the two temperatures,
-and `rhlevel` is the only other setpoint it has — so dry is the humidity mode and the
-humidity target is a number the device acts on. That replaced a three-minute wait for the
-ambient humidity to fall, which failed against a working unit: the reading flaps between
-two adjacent integers, so its own noise is the size of the change being looked for.
+Dry mode: park the temperature setpoint where the unit calls itself satisfied, change
+nothing about it, and switch to dry with a humidity target below ambient. If `reachtarget`
+goes out, the device is comparing something other than the two temperatures, and `rhlevel`
+is the only other setpoint it has — so dry is the humidity mode and the humidity target is
+a number the device acts on. That also fixes the field's polarity: a unit with the room at
+76% and a target of 30% read `reachtarget` 0, and an air conditioner cannot add water, so
+0 is "not yet".
+
+Cool mode, with the polarity pinned and mode 2 accounted for, is then just the direction.
+Put the target above the room and the thermostat is satisfied; put it below and it is not.
+A heating thermostat is exactly the other way round, so one reading from each side of
+ambient settles it.
+
+Both of those replaced a three-minute wait for the room to move, and both waits were wrong
+for the same reason. Each ambient reading alternates between two adjacent integers about a
+second apart, so the instrument's noise is twice the smallest change either check could
+look for. The humidity version failed against a unit that was dehumidifying. The cooling
+version passed in 0.0 seconds on one live run, having caught the reading on its way down
+from 83 to 81, and then failed after the full three minutes on the next — same unit, same
+room, same firmware. Watching for a stable baseline first does not rescue it, because a
+reading that alternates reads the same at both ends of a poll.
+
+So whether the machine removes any heat or any water is not something this suite answers.
+It is on the uncovered list below, with the reason.
 
 Every check reports what it measured, pass or fail, because pinning down a number the
 table only guesses at is half the reason to run it — including how long the machine took,
@@ -239,6 +256,12 @@ ignores every command to it, so the switch built from that field did nothing. Bo
 lost a claim too: fan mode turns down sleep, but accepts Extra and eco, and a unit powered
 down does not necessarily park its fan.
 
+The second run, with those four corrections in, passed 34 of 38 and left two failures that
+were both bugs in this suite rather than in the library: the cooling check described above,
+and an off-state check that wrote the fan speed the unit was already at and treated the
+read-back as evidence. Which is the other thing a rare, thorough run buys — the checks get
+audited by the hardware they audit.
+
 Two checks deliberately bypass validation, and only these two: the setpoint and humidity
 ranges are probed one step past each end with a raw frame. Every other check can find a
 range that is too *wide*, because the library offers a value and the device clamps it.
@@ -254,8 +277,9 @@ never tested the beeper, and failed a humidity bound before reaching the probe b
 What a passing run still does not cover is stated rather than implied: the Celsius mapping
 (`tempunit` is read-only), the fault-code vocabulary and the water and filter readings
 (cannot be induced), availability (needs the plug pulled), which louvre `oscset1` moves
-(needs eyes on the unit), and whether dry mode removes any water — the ambient humidity
-reading's own flap between two integers is larger than anything one run can measure.
+(needs eyes on the unit), and whether the machine actually cools or removes any water —
+each ambient reading's own flap between two adjacent integers is larger than anything one
+run can measure, which is also why neither reading can be confirmed as the room's.
 
 A failure means a claim in this library that your hardware does not support — a different
 firmware, or a model the table describes wrongly. `-o results.json` writes the run with

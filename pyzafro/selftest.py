@@ -687,48 +687,61 @@ async def sleep_is_refused_in_fan_mode(ctx: Context) -> None:
             await ctx.command(ctx.device.async_set_mode(was_mode))
 
 
-@_check("protocol", "A setting written while the unit is off does not stick", cost=4)
-async def the_unit_off_is_not_a_state_settings_survive(ctx: Context) -> None:
-    """Check the two claims the off state rests on, one of which this tool relies on.
+@_check("protocol", "A unit that is off keeps the fan speed it was given", cost=4)
+async def the_off_state_keeps_the_fan_speed_it_was_given(ctx: Context) -> None:
+    """Check the two halves of what an off unit does with a speed, both now documented.
 
-    First, that the fan parks at its slowest speed when the unit is powered down and
-    reports that. Second, that a setting written to a unit that is off is not kept.
-    `_restore` is built on the second: it sends settings before power when the unit was
-    found off, because the other order would silently lose them. A tool whose promise to
-    put things back depends on an unverified assumption should verify it.
+    Both were assumed the other way round until a live run, and both READMEs said so:
+    that the fan parks at its slowest speed when the unit is powered down, and that a
+    setting written to a unit that is off is discarded. `_restore` was built on the
+    second, sending settings before power when the unit was found off, because the other
+    order would silently lose them.
 
-    A live run refused both. Powered down at speed 4 the unit reported 4, and a fresh
-    `windlevel: 4` sent while off was acknowledged and never corrected. Both READMEs had
-    been telling users that a fan speed shown while off was the parked one, on the
-    strength of an earlier probe that happened to be run off. The ordering in `_restore`
-    is kept because it costs nothing and cannot be wrong, but it is a precaution now
-    rather than a requirement. Both halves are asserted and both reported, which is the
-    fix for a check that measured one of its claims and asserted only the other.
+    Powered down at its top speed the unit reported the top speed, and a speed written
+    while off was acknowledged and never corrected. So the claim is the other way up
+    now, and this is what asserts the version the READMEs tell users: the fan does not
+    park, and a write while off sticks. A unit that parks or discards is a firmware this
+    documentation is wrong about, and it makes `_restore`'s ordering load-bearing again
+    rather than the precaution it was demoted to.
+
+    The speed written while off has to be a different speed from the one the unit is
+    already at, which the first version of this check got wrong. It wrote the top speed
+    to a unit already sitting at the top speed, so the read-back was the same number
+    whether the write landed or was thrown away, and the check reported "settings do
+    stick after all" on evidence that could not distinguish the two.
 
     Read from a `cmd:3` reply for the same reason the feature walk is: these are values
     the library sent and the device did not mention, so merged state would answer with
     this library's own optimism.
     """
     ctx.requires(Feature.FAN_SPEED)
+    top, other = ctx.top_speed(), ctx.slowest_speed()
+    if top == other:
+        raise CheckSkippedError(
+            f"the model offers only speed {top}, so a speed written while off "
+            f"cannot be told apart from the one already set"
+        )
     was_power = ctx.state.power
-    await ctx.command(ctx.device.async_set_fan_speed(ctx.top_speed()))
+    await ctx.command(ctx.device.async_set_fan_speed(top))
     await ctx.command(ctx.device.async_set_power(on=False))
     parked = (await ctx.confirmed()).fan_speed
     ctx.note(fan_speed_while_off=parked)
     try:
-        await ctx.command(ctx.device.async_set_fan_speed(ctx.top_speed()))
+        await ctx.command(ctx.device.async_set_fan_speed(other))
         kept = (await ctx.confirmed()).fan_speed
-        ctx.note(fan_speed_commanded_while_off=kept)
+        ctx.note(fan_speed_written_while_off=other, fan_speed_read_back_while_off=kept)
         ctx.expect_but_continue(
-            parked != ctx.top_speed(),
-            f"the unit was powered down at speed {ctx.top_speed()} and still reports "
-            f"{parked}; it does not park the fan, so the integration's README is wrong "
-            f"to tell users that Low while off is the real setting",
+            parked == top,
+            f"the unit was powered down at speed {top} and reports {parked}; it "
+            f"parks the fan, so both READMEs are wrong to tell users that a speed "
+            f"shown while off is whatever it was last set to",
         )
         ctx.expect_but_continue(
-            kept != ctx.top_speed(),
-            f"the unit is off and it kept fan speed {kept}; settings written while off "
-            f"do stick after all, so _restore is ordering its frames for no reason",
+            kept == other,
+            f"speed {other} was written to a unit that is off and it reads back "
+            f"{kept}; the write was discarded, so _restore has to keep sending "
+            f"settings before power and that ordering is a requirement, not a "
+            f"precaution",
         )
     finally:
         if was_power:
@@ -1107,13 +1120,20 @@ async def some_assumptions_cannot_be_checked_at_all(ctx: Context) -> None:
     means pulling the plug out; and which louvre `oscset1` moves can only be settled by
     watching the unit. Both are jobs for a human standing next to it.
 
-    Whether the unit removes water in dry mode, and whether `rh` is the room's humidity
-    rather than some reading inside the machine, went on this list after a live run. A
-    check asked it of a real dehumidifying unit for three minutes and failed it: the
-    reading flaps continuously between two adjacent integers, so its own noise is the
-    size of the change being looked for, and a room reloads humidity as fast as a window
-    unit takes it out. What this library actually claims about that mode is tested
-    without the room, in `dry_mode_regulates_humidity_not_temperature`.
+    Whether the machine cools, and whether it removes water in dry mode, are the two
+    that went on this list after live runs, and both for the same reason. Each ambient
+    reading alternates between two adjacent integers about a second apart, so the noise
+    is twice the smallest change a check could look for. The humidity check failed
+    against a unit that was dehumidifying. The cooling check passed in 0.0 seconds on
+    one run, catching the reading on its way down from 83 to 81, and then failed after a
+    full three minutes on the next, same unit and same room. Whether `rh` and
+    `temperature` are the room rather than some reading inside the machine is
+    unanswerable for exactly the same reason.
+
+    What this library actually claims about those two modes is which setpoint each one's
+    thermostat watches and in which direction, and both are tested without the room, in
+    `cool_mode_is_the_mode_that_cools` and
+    `dry_mode_regulates_humidity_not_temperature`.
     """
     unit = ctx.state.temperature_unit
     ctx.note(temperature_unit=unit and unit.name.lower())
@@ -1121,9 +1141,10 @@ async def some_assumptions_cannot_be_checked_at_all(ctx: Context) -> None:
         "not covered: the Celsius mapping (tempunit is read-only, this unit reports "
         f"{unit.name.lower() if unit else unit}); the fault-code vocabulary and the "
         "water/filter readings (cannot be induced); availability (needs the plug "
-        "pulled); which axis oscset1 moves (needs eyes on the louvres); whether dry "
-        "mode removes water, and whether rh is the room (the reading's own flap "
-        "between two integers is larger than anything measurable in one run)"
+        "pulled); which axis oscset1 moves (needs eyes on the louvres); whether the "
+        "machine actually cools or removes any water, and whether the ambient readings "
+        "are the room (each one's flap between two adjacent integers is larger than "
+        "anything one run can measure)"
     )
 
 
@@ -1287,12 +1308,20 @@ async def base_info_reports_a_signal_strength(ctx: Context) -> None:
 # state class that promises Home Assistant a monotonic statistic.
 #
 # Those claims happen to be unfalsifiable from a unit with a satisfied thermostat, which
-# is the state every other suite arranges. Physical consequence is not the object of the
-# measurement here; it is the only available instrument for reading a field's meaning.
-# That is why this suite is allowed to run the compressor, and the whole of why.
+# is the state every other suite arranges. So this is the one suite that leaves the
+# thermostat unsatisfied, and the whole of why it is allowed to run the compressor.
 #
-# Each check waits, so this is where the minutes go — but each wait ends as soon as it
-# has its answer.
+# What it does not do is read the room. Every version of that was tried and none of it
+# worked: both ambient readings alternate between two adjacent integers about a second
+# apart, so the instrument's noise is twice the smallest change a check could look for,
+# and two runs of one check on one unit disagreed. What these mappings actually claim is
+# which setpoint a mode's thermostat compares against and in which direction, and the
+# MCU answers that in a second from two numbers it already holds. Whether the machine
+# cools or dries is a fact about somebody's appliance, and is reported as uncovered
+# rather than guessed at.
+#
+# Each check still waits, so this is where the minutes go — but every wait ends as soon
+# as it has its answer, and none of them waits on physics.
 
 
 @_check(
@@ -1354,76 +1383,91 @@ async def reached_target_follows_the_setpoint(ctx: Context) -> None:
         await ctx.command(ctx.device.async_set_target_temperature(high))
 
 
-@_check("thermal", "Mode.COOL is the mode that cools", cost=2, soaks=1)
+@_check(
+    "thermal",
+    "Mode.COOL is the mode that cools",
+    cost=2,
+    reaches=1,
+)
 async def cool_mode_is_the_mode_that_cools(ctx: Context) -> None:
     """Check `Mode.COOL = 1`, read off the app's label switch and never tested since.
 
     The `Mode` values came from decompiled Dart — a switch statement mapping ints to
     display strings — and every check but this one would pass with the enum shuffled.
     Commanding mode 1 and reading mode 1 back proves the device accepts the number, not
-    that the number means cooling; `reachtarget` flipping proves the MCU compares the
-    setpoint against ambient, which dry mode would do too. `Mode` is what labels the
-    entire HVAC dropdown a consumer builds, so a mislabelled member puts "Cool" on the
-    button that dehumidifies and nothing anywhere reports an error.
+    that the number means cooling. `Mode` is what labels the entire HVAC dropdown a
+    consumer builds, so a mislabelled member puts "Cool" on the button that dehumidifies
+    and nothing anywhere reports an error.
 
-    Watching the room is not the object here and this is not a verdict on the appliance:
-    it is the only instrument available for reading what a mode number means. Which is
-    also why a failure names both possible causes and says which one is in scope — this
-    check cannot tell a mislabelled enum from a unit that is not cooling, and only the
-    first is a bug in this library.
+    What the claim amounts to is which setpoint this mode's thermostat watches and which
+    way round it watches it, and both are readable from `reachtarget` without waiting
+    for a room. The dry-mode check below closes the argument. It establishes that mode 2
+    ignores the temperature target entirely and watches `rhlevel`, so mode 1 is not the
+    dehumidify mode wearing cool's number; and it fixes the field's polarity, because a
+    unit with the room at 76% and a target of 30% read `reachtarget` 0, and an air
+    conditioner has no way to add water, so 0 is "not yet" and not "done". With the
+    polarity pinned, the direction is the whole
+    claim: a cooling thermostat is satisfied when the target sits above the room and
+    unsatisfied when it sits below, and a heating thermostat is exactly the other way
+    round. Which is what this check reads, twice, from either side of ambient.
 
-    The same argument covers `temperature` being the ambient reading rather than a coil
-    or a board, since a value that does not move while the unit cools is not the room.
+    That is a change of instrument. This check used to set the setpoint to its floor,
+    put the fan flat out and wait up to three minutes for the room to fall, on the
+    argument that physical consequence was the only way to read a mode number. It is
+    not, and the room was a bad instrument for it: the ambient reading alternates
+    between two adjacent integers about a second apart, so the noise is twice the
+    smallest change the check could detect. One live run passed it in 0.0 seconds — it
+    caught the reading on the way down from 83 to 81 and credited the command with it —
+    and the next failed it after a full 180 seconds, on the same unit in the same room.
+    A stable baseline was tried first and does not help, because a reading that
+    alternates reads the same at both ends of a poll.
 
-    The baseline has to be still before the command goes out. A live run passed this in
-    0.0 seconds — the reading had already fallen two degrees before the wait began, left
-    over from the check before it, and a fall the command cannot be credited with proves
-    nothing about what the command means. So the reading is watched for a poll first,
-    and a room already on its way down is a skip rather than a pass.
+    Whether the machine actually removes heat is a different question, and not this
+    library's: it is reported as uncovered rather than guessed at.
     """
+    if BinarySensorKey.REACHED_TARGET not in ctx.caps.binary_sensors:
+        raise CheckSkippedError("model does not report reached_target")
     low, high = ctx.temperature_bounds()
     if ctx.state.mode is not Mode.COOL:
         raise CheckSkippedError("this needs cool mode")
-    before = ctx.state.ambient_temperature
-    if before is None:
-        raise CheckSkippedError("the device reports no ambient temperature")
-    if before <= low:
+    ambient = ctx.state.ambient_temperature
+    if ambient is None or not low < ambient < high:
         raise CheckSkippedError(
-            f"ambient is already {before}, at or below the lowest setpoint {low}, so "
-            f"cooling cannot be told apart from doing nothing"
-        )
-    settling = await ctx.until(
-        lambda: (now := ctx.state.ambient_temperature) is not None and now != before,
-        timeout=ctx.poll_seconds,
-    )
-    if settling is not None:
-        ctx.note(ambient_was_already_moving_from=before)
-        raise CheckSkippedError(
-            f"ambient moved from {before} to {ctx.state.ambient_temperature} before "
-            f"this check commanded anything, so a fall cannot be attributed to it"
+            f"ambient is {ambient}, not strictly inside the setpoint range "
+            f"{low}-{high}, so the thermostat cannot be put on both sides of the room"
         )
     try:
-        await ctx.command(ctx.device.async_set_fan_speed(ctx.top_speed()))
+        await ctx.command(ctx.device.async_set_target_temperature(high))
+        above = (await ctx.confirmed()).reached_target
         await ctx.command(ctx.device.async_set_target_temperature(low))
         waited = await ctx.until(
-            lambda: (now := ctx.state.ambient_temperature) is not None and now < before
+            lambda: ctx.state.reached_target != above,
+            timeout=min(REACH_WAIT, ctx.soak_seconds),
         )
-        after = ctx.state.ambient_temperature
-        ctx.note(
-            ambient_before=before,
-            ambient_after=after,
-            seconds_to_fall=waited and round(waited, 1),
-        )
-        ctx.expect(
-            waited is not None,
-            f"mode {int(Mode.COOL)} is decoded as cool, but ambient read {before} and "
-            f"still reads {after} after {ctx.soak_seconds:.0f}s with the setpoint at "
-            f"{low} and the fan flat out. Either that mapping is wrong — which would "
-            f"mislabel the whole mode list — or the unit is not cooling, which is not "
-            f"this library's problem and not something this check can tell apart",
-        )
+        below = ctx.state.reached_target
     finally:
         await ctx.command(ctx.device.async_set_target_temperature(high))
+    ctx.note(
+        ambient_temperature=ambient,
+        reached_target_with_target_above_ambient=above,
+        reached_target_with_target_below_ambient=below,
+        seconds_to_change=waited and round(waited, 1),
+    )
+    if waited is None:
+        raise CheckSkippedError(
+            f"reached_target read {above} with the target at {high} and still reads "
+            f"{below} with it at {low}, so there is no comparator here to read a "
+            f"direction off; reached_target_follows_the_setpoint is the check that "
+            f"claim belongs to"
+        )
+    ctx.expect(
+        above is True and below is False,
+        f"mode {int(Mode.COOL)} is decoded as cool, but its thermostat reads {above} "
+        f"with the target at {high} and {below} with it at {low}, against a room at "
+        f"{ambient}. Satisfied below the room and unsatisfied above it is a heating "
+        f"thermostat, so mode {int(Mode.COOL)} is not cool and the whole mode list is "
+        f"mislabelled",
+    )
 
 
 @_check(
@@ -1834,10 +1878,11 @@ class SelfTest:
         """Get the unit into the one state in which the fan can be measured.
 
         On, in cool mode, with the setpoint at its maximum. Nothing about the fan can be
-        measured with the unit off — off, the device parks the fan at its slowest speed
-        and reverts every speed asked for — and sleep, EXTRA and eco are refused
-        outright in fan mode. Cool mode is therefore the only state where all of them
-        are answerable.
+        measured with the unit off, because a unit that is off reports whatever speed it
+        was last told and keeps a speed written while off, all without the fan turning —
+        so every reading would be of the field and none of the fan. Sleep is refused in
+        fan mode. Cool mode is therefore the only state where all of them are
+        answerable.
 
         The setpoint goes to the top not to protect the room but to keep the compressor
         out of checks that are not about it: a check that has to make the machine work

@@ -102,9 +102,8 @@ class FakeUnit:
         tracks_target: bool = True,
         runtime_step: int = 1,
         holds_speed_zero: bool = False,
-        keeps_settings_while_off: bool = False,
-        parks_fan_when_off: bool = True,
-        ambient_already_falling: bool = False,
+        keeps_settings_while_off: bool = True,
+        parks_fan_when_off: bool = False,
         allows_programmes_in_fan_mode: bool = False,
         reports_origin: bool = True,
         silent_keys: tuple[str, ...] = (),
@@ -133,14 +132,13 @@ class FakeUnit:
         self.tracks_target = tracks_target
         self.runtime_step = runtime_step
         self.holds_speed_zero = holds_speed_zero
+        #: Both default to what a live run found and what both READMEs now say: the fan
+        #: does not park when the unit is powered down, and a speed written while off
+        #: sticks. The opposite of each was assumed until that run, and `_restore` still
+        #: sends settings before power on the strength of the older reading, which costs
+        #: nothing and cannot be wrong either way.
         self.keeps_settings_while_off = keeps_settings_while_off
-        #: Whether powering down drops the fan to its slowest speed, which the
-        #: integration's README tells users is why Low shows while off.
         self.parks_fan_when_off = parks_fan_when_off
-        #: A room already on its way down before anything is commanded, which is what a
-        #: check that cooled just before this one leaves behind.
-        self.ambient_already_falling = ambient_already_falling
-        self._drift = -1
         self.allows_programmes_in_fan_mode = allows_programmes_in_fan_mode
         self.reports_origin = reports_origin
         #: Wire keys this unit drops in total silence: no acknowledgement and no
@@ -216,11 +214,9 @@ class FakeUnit:
     def _replies_to(self, payload: dict[str, Any]) -> list[tuple[int, dict[str, Any]]]:
         cmd = payload["cmd"]
         if cmd == 3:
-            # A full read is also the moment a real unit's counters have advanced, and
-            # the moment a room that is moving on its own has moved. Both are functions
-            # of time rather than of anything commanded, so neither waits for a command.
+            # A full read is also the moment a real unit's counter has advanced,
+            # which is a function of time rather than of anything commanded.
             self._tick()
-            self._drift_ambient()
             self._recompute()
             return [(3, self._stamp(dict(self.wire), 0))]
         if cmd == 5:
@@ -261,7 +257,6 @@ class FakeUnit:
             left_sleep |= self._side_effects(key, self.wire[key], previous)
         if left_sleep:
             self._move("windlevel", self._saved_speed)
-        self._work()
         self._recompute()
 
     def _refuses(self, key: str, value: Any) -> bool:
@@ -317,38 +312,6 @@ class FakeUnit:
             self._move("templevel", 76)
         return False
 
-    def _work(self) -> None:
-        """Do what the machine does, on the fake's own timescale.
-
-        A real unit moves the room over minutes. Here one command stands in for one
-        soak, which is the only way a check that waits on physics can be tested at
-        settle and soak zero.
-        """
-        if not self.wire["poweron"]:
-            return
-        if self.ambient_already_falling:
-            return
-        floor = max(self.wire["templevel"], self.real_temp_range[0])
-        if (
-            self.cools
-            and self.wire["mode"] == COOL
-            and self.wire["temperature"] > floor
-        ):
-            self._move("temperature", self.wire["temperature"] - 1)
-
-    def _drift_ambient(self) -> None:
-        """Move a room that is already moving, whatever was or was not commanded.
-
-        Never still, the way a room is for a while after the check before this one
-        stopped cooling it. It alternates rather than running away, because a reading
-        that left the setpoint range would skip for that reason instead — and because
-        the live unit's humidity reading really does flap between two integers.
-        """
-        if not self.ambient_already_falling:
-            return
-        self._move("temperature", self.wire["temperature"] + self._drift)
-        self._drift = -self._drift
-
     def _tick(self) -> None:
         """Advance the runtime counter, which a full read is a chance to notice."""
         if "worktime" in self.wire and self.wire["poweron"]:
@@ -366,7 +329,15 @@ class FakeUnit:
         # went out. A fake that called dry mode reached whatever the humidity was doing
         # would pass that check without the device having to do anything.
         if self.wire["mode"] == COOL:
-            reached = self.wire["temperature"] <= self.wire["templevel"]
+            # Which side of the room this mode is satisfied on is the whole of what
+            # `Mode.COOL = 1` claims. A thermostat satisfied when the target sits below
+            # the room is a heating thermostat wearing cool's number, and the live unit
+            # is satisfied above it.
+            reached = (
+                self.wire["temperature"] <= self.wire["templevel"]
+                if self.cools
+                else self.wire["temperature"] >= self.wire["templevel"]
+            )
         elif self.wire["mode"] == DRY and self.regulates_humidity:
             reached = self.wire["rh"] <= self.wire["rhlevel"]
         else:
@@ -729,11 +700,17 @@ async def test_a_smaller_selection_of_suites_is_a_shorter_run(unit):
 
 
 async def test_the_waits_dominate_the_estimate(unit):
-    """Someone told five minutes and kept for twenty will not run this again."""
+    """Someone told five minutes and kept for twenty will not run this again.
+
+    Against the settling between commands, which is the other thing the estimate is
+    made of. Stated structurally rather than as a multiple of `--soak`, because only one
+    thermal check waits on a soak now and the rest are budgeted a minute each.
+    """
     device = _device(unit)
     thermal = SelfTest(device, suites=["thermal"])
     device.close()
-    assert thermal.estimate() > 3 * thermal.soak
+    settling = sum(c.cost for c in CHECKS if c.suite == "thermal") * thermal.settle
+    assert thermal.estimate() > 4 * settling
 
 
 async def test_the_plan_says_the_thermal_figure_is_a_ceiling(unit):
@@ -808,12 +785,51 @@ async def test_the_refusal_is_also_how_reconciliation_gets_exercised():
     assert "no override here to reconcile" in overridden.detail
 
 
-async def test_a_unit_that_keeps_settings_while_off_is_a_failure():
-    """`_restore` orders its frames on this, so the tool depends on it being true."""
-    _, results = await _run(FakeUnit(keeps_settings_while_off=True))
-    off = _one(results, "the_unit_off_is_not_a_state_settings_survive")
+async def test_the_off_state_both_readmes_describe_is_a_pass():
+    """The claim is the way round the live run left it, so the default unit passes.
+
+    Powered down at its top speed the unit reported the top speed, and a speed written
+    while off was kept. Both READMEs now tell users that, so a unit doing it is not a
+    finding — and the version of this check that asserted the opposite failed a unit
+    that was behaving exactly as documented.
+    """
+    _, results = await _run(FakeUnit())
+    off = _one(results, "the_off_state_keeps_the_fan_speed_it_was_given")
+    assert off.outcome == "pass"
+
+
+async def test_a_setting_discarded_while_off_is_a_failure():
+    """`_restore` sends settings before power on the strength of the older reading.
+
+    A unit that throws a write away while off makes that ordering a requirement again
+    rather than the precaution it was demoted to, and makes both READMEs wrong about
+    what an off unit reports.
+    """
+    _, results = await _run(FakeUnit(keeps_settings_while_off=False))
+    off = _one(results, "the_off_state_keeps_the_fan_speed_it_was_given")
     assert off.outcome == "fail"
-    assert "_restore is ordering its frames for no reason" in off.detail
+    assert "the write was discarded" in off.detail
+    # The evidence, not just the verdict: the speed read back is the one the unit was
+    # already at, which is only visible because a different speed was written.
+    assert (
+        off.measured["fan_speed_read_back_while_off"]
+        == off.measured["fan_speed_while_off"]
+    )
+
+
+async def test_the_speed_written_while_off_is_not_the_one_already_set():
+    """The first version of this check wrote the top speed to a unit already at it.
+
+    So the read-back was the same number whether the write landed or was thrown away,
+    and it reported "settings do stick after all" on evidence that could not tell the
+    two apart. The speed it writes has to differ from the speed it will be compared to.
+    """
+    _, results = await _run(FakeUnit(keeps_settings_while_off=False))
+    off = _one(results, "the_off_state_keeps_the_fan_speed_it_was_given")
+    assert (
+        off.measured["fan_speed_while_off"]
+        != off.measured["fan_speed_written_while_off"]
+    )
 
 
 async def test_a_device_that_stops_reporting_origin_is_a_failure():
@@ -977,19 +993,28 @@ async def test_a_mode_number_that_may_be_mislabelled_is_a_failure():
     _, results = await _run(FakeUnit(cools=False))
     cooling = _one(results, "cool_mode_is_the_mode_that_cools")
     assert cooling.outcome == "fail"
-    assert "mislabel the whole mode list" in cooling.detail
+    assert "the whole mode list is mislabelled" in cooling.detail
 
 
-async def test_the_failure_says_which_of_its_two_causes_is_in_scope():
-    """It cannot tell a wrong mapping from a unit that is not cooling, and says so.
+async def test_the_cool_check_reads_the_thermostat_and_not_the_room():
+    """It used to wait three minutes for the room to fall, which cannot be measured.
 
-    The distinction matters because only one of them is this library's problem, and a
-    check that blamed the appliance would be a test of somebody's hardware rather than
-    of this code.
+    The ambient reading alternates between two adjacent integers, so two live runs of
+    that version disagreed on the same unit in the same room: a pass in 0.0 seconds off
+    a reading on its way down, then a failure after the full soak. What the mapping
+    claims is which way round the thermostat is satisfied, which the MCU answers at
+    once — so the check carries a `reaches` deadline rather than a `soaks` one, and
+    never reads `ambient_temperature` for a verdict.
     """
-    _, results = await _run(FakeUnit(cools=False))
-    cooling = _one(results, "cool_mode_is_the_mode_that_cools")
-    assert "not this library's problem" in cooling.detail
+    cooling = next(c for c in CHECKS if c.suite == "thermal" and "cool_mode" in c.name)
+    assert cooling.soaks == 0
+    assert cooling.reaches == 1
+
+    _, results = await _run(FakeUnit())
+    passed = _one(results, "cool_mode_is_the_mode_that_cools")
+    assert passed.outcome == "pass"
+    assert passed.measured["reached_target_with_target_above_ambient"] is True
+    assert passed.measured["reached_target_with_target_below_ambient"] is False
 
 
 async def test_a_humidity_target_the_device_only_stores_is_a_failure():
@@ -1233,38 +1258,25 @@ async def test_the_off_state_check_asks_the_device_rather_than_its_own_optimism(
     Both halves are about a value the library sent and the device did not mention, so
     the merged state is this library quoting itself. Only a full re-read can settle it.
     """
-    transport = FakeUnit(keeps_settings_while_off=True)
+    transport = FakeUnit(parks_fan_when_off=True)
     _, results = await _run(transport)
-    off = _one(results, "the_unit_off_is_not_a_state_settings_survive")
+    off = _one(results, "the_off_state_keeps_the_fan_speed_it_was_given")
 
     assert off.outcome == "fail"
-    assert "_restore is ordering its frames for no reason" in off.detail
+    assert "it parks the fan" in off.detail
     # Its own trace has to carry the full-state replies, one per reading it took. A
     # merged-state read would answer from the library's optimism and never ask.
     assert sum(frame["cmd"] == 3 for frame in off.trace) == 2
 
 
-async def test_a_unit_that_does_not_park_the_fan_is_reported_too():
+async def test_a_unit_that_parks_the_fan_when_off_is_reported_too():
     """The other half of the same claim, which the check used to measure and not assert.
 
-    The integration's README tells users that Low while off is the real setting. A unit
-    that keeps speed 4 while off makes that advice wrong, and the live run found one.
+    Both READMEs tell users that a speed shown while off is whatever it was last set to.
+    A unit that drops to its slowest speed when powered down makes that advice wrong.
     """
-    _, results = await _run(FakeUnit(holds_speed_zero=True, parks_fan_when_off=False))
-    off = _one(results, "the_unit_off_is_not_a_state_settings_survive")
+    _, results = await _run(FakeUnit(holds_speed_zero=True, parks_fan_when_off=True))
+    off = _one(results, "the_off_state_keeps_the_fan_speed_it_was_given")
 
     assert off.outcome == "fail"
-    assert "does not park the fan" in off.detail
-
-
-async def test_a_fall_the_command_cannot_be_credited_with_is_not_a_pass():
-    """The live run passed this in 0.0 seconds, off a reading already on its way down.
-
-    Cooling left over from the check before says nothing about what mode 1 means, and a
-    check that accepts it would pass a unit with the enum shuffled.
-    """
-    _, results = await _run(FakeUnit(ambient_already_falling=True))
-    cooling = _one(results, "cool_mode_is_the_mode_that_cools")
-
-    assert cooling.outcome == "skip"
-    assert "before this check commanded anything" in cooling.detail
+    assert "it parks the fan" in off.detail
