@@ -727,24 +727,32 @@ async def the_off_state_keeps_the_fan_speed_it_was_given(ctx: Context) -> None:
     """Check the two claims the off state rests on, one of which this tool relies on.
 
     Whether the fan parks at its slowest speed when the unit is powered down, and
-    whether a setting written to a unit that is off is kept. `_restore` is built on the
-    second: it sends settings before power when the unit was found off, because the
-    other order would silently lose them. A tool whose promise to put things back
-    depends on an assumption should check the assumption.
+    whether a setting written to a unit that is off is kept. `_restore` orders its
+    frames around the second, so a tool whose promise to put things back depends on an
+    assumption should check the assumption.
 
     **Both readings have to wait out the turn-off timer**, which is what the first two
-    versions of this check got wrong and what makes everything either of them concluded
-    unusable. The window unit takes about twenty seconds to finish shutting down, with
-    the fan still running; the check read at 5.5s and again at 12.1s and then powered
-    the unit back on at 12.7s, so it never saw the unit off. What it recorded as "this
-    unit does not park its fan" was a fan still spinning down, which is what a shutdown
-    looks like, and the write it called sticky landed on a unit that had not finished
-    going off. Both READMEs were changed on that evidence and have been changed back.
+    versions of this check got wrong. The window unit takes about twenty seconds to
+    finish shutting down with the fan still running; those versions read at 5.5s and
+    again at 12.1s and powered the unit back on at 12.7s, so neither ever saw the unit
+    off, and nothing either of them concluded was usable.
 
-    So the claim here is the way round it always was, on the older evidence that a probe
-    hours before the first live run found every speed written while off reverting to the
-    slowest. Whether the timer explains that observation too is exactly what a run that
-    waits past it will say.
+    **Measured properly on 2026-09-27, the answers are: no and yes.** Powered down at
+    speed 4, the unit reported 4 in three separate `cmd:3` replies at 21.1s, 31.1s and
+    31.7s after the power-off — past the timer, so not a fan spinning down. Speed 1 was
+    then written 32s after the power-off and read back as 1 at 53s, 63s and 64s. So the
+    fan does not park, and a setting written to a unit that is off does stick.
+
+    That is the third time these two claims have moved, so: what makes this reading
+    different from the two before it is that every value in it was taken outside the
+    shutdown window, and each of the two conclusions rests on three full reads rather
+    than one. A probe hours before the first live run had seen speeds written while off
+    revert to the slowest; that probe is presumed to have had the same defect, because
+    nothing in it recorded how long after the power-off it read.
+
+    The consequence for consumers is that the speed shown while the unit is off is the
+    setting and not a parked value, which is what `pyzafro`'s README and the
+    integration's now say.
 
     The speed written while off has to differ from the speed the unit is reporting by
     then, which is why it is chosen after the first reading rather than before it. An
@@ -792,17 +800,17 @@ async def the_off_state_keeps_the_fan_speed_it_was_given(ctx: Context) -> None:
             seconds_to_revert=reverting and round(reverting, 1),
         )
         ctx.expect_but_continue(
-            parked != top,
-            f"the unit was powered down at speed {top} and still reports {parked} "
-            f"{window:.0f}s later, past its turn-off timer; it does not park the fan, "
-            f"so both READMEs are wrong to tell users that a speed shown while off is "
-            f"the parked one",
+            parked == top,
+            f"the unit was powered down at speed {top} and reports {parked} after "
+            f"{window:.0f}s, past its turn-off timer: it parks the fan. Then the speed "
+            f"shown while off is not the setting, and neither README should say it is",
         )
         ctx.expect_but_continue(
-            kept != target,
-            f"speed {target} was written to a unit that is off and it still reads "
-            f"{kept} {window:.0f}s later; settings written while off do stick, so "
-            f"_restore is ordering its frames for no reason",
+            kept == target,
+            f"speed {target} was written to a unit that is off and reads back as "
+            f"{kept} {window:.0f}s later: the write was discarded. Then `_restore` "
+            f"must send settings before power when the unit was found off, and a "
+            f"consumer writing to an off unit is writing to nothing",
         )
     finally:
         if was_power:
@@ -1921,6 +1929,17 @@ class SelfTest:
         Raw frames rather than the setters, for the reason `_restore` uses them: a
         setter can refuse — the setpoint outside cool mode — and giving up half way
         through is worse than not trying.
+
+        **The mode is parked here too**, and that is the point of parking anything here.
+        Three thermal checks skip unless they are handed cool mode, and for two runs it
+        was handed to them by luck: the liveness check that sends two conflicting
+        commands and keeps whichever the device answered with sends two *modes*, so the
+        mode the suite left behind was the outcome of a race. Run 2 happened to leave
+        cool and the checks ran; run 3 left dry and all three skipped, reporting nothing
+        about the claim they exist for. A precondition that a *later* check needs must
+        not depend on what an *earlier* one happened to leave, so it is established
+        between checks rather than hoped for — the same argument that put the setpoint
+        park here, one field over.
         """
         state = self.device.state
         caps = self.device.capabilities
@@ -1929,9 +1948,12 @@ class SelfTest:
             for name, value in self._NEUTRAL
             if getattr(state, name) is not None and getattr(state, name) != value
         }
+        cools = Mode.COOL in caps.modes
+        if cools and state.mode is not Mode.COOL:
+            fields["mode"] = Mode.COOL
         bounds = caps.target_temperature_range
         if (
-            state.mode is Mode.COOL
+            cools
             and bounds is not None
             and state.target_temperature is not None
             and state.target_temperature != bounds[1]
@@ -1974,9 +1996,12 @@ class SelfTest:
         unit back in cool mode would raise — and a restore that gives up half way is
         worse than no restore at all. `build_command` still orders the keys.
 
-        Settings first and power last when the unit was found off, because a unit that
-        is off does not keep what it is told. Power first when it was found on, so what
-        follows lands on a running unit.
+        Settings first and power last when the unit was found off, so that the last
+        frame is the one that leaves it off and the unit is never briefly running when
+        it was found idle. The original reason was that a unit which is off does not
+        keep what it is told, which turned out to be false — a speed written 32s after
+        a power-off read back unchanged 31s later — but the order is still the one that
+        hands the unit back the way it was found, so it stays.
 
         Then it reads the device again and says what did not come back. The promise to
         put the unit back is the one this tool makes to the person who agreed to let it

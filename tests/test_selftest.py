@@ -17,6 +17,7 @@ import pytest
 
 from pyzafro.capabilities import Feature, resolve
 from pyzafro.device import ZafroDevice
+from pyzafro.models import Mode
 from pyzafro.selftest import (
     CHECKS,
     POWER_DOWN,
@@ -103,8 +104,8 @@ class FakeUnit:
         tracks_target: bool = True,
         runtime_step: int = 1,
         holds_speed_zero: bool = False,
-        keeps_settings_while_off: bool = False,
-        parks_fan_when_off: bool = True,
+        keeps_settings_while_off: bool = True,
+        parks_fan_when_off: bool = False,
         parks_after_reads: int = 0,
         allows_programmes_in_fan_mode: bool = False,
         reports_origin: bool = True,
@@ -134,9 +135,14 @@ class FakeUnit:
         self.tracks_target = tracks_target
         self.runtime_step = runtime_step
         self.holds_speed_zero = holds_speed_zero
+        #: Whether a write to a unit that is off is kept. The window unit keeps it: a
+        #: speed written 32s after a power-off read back unchanged 31s later. Both
+        #: defaults here were the other way up until run 3 measured them past the
+        #: turn-off timer, which is why the default unit is the one that passes.
         self.keeps_settings_while_off = keeps_settings_while_off
-        #: Whether powering down drops the fan to its slowest speed, which is why Low
-        #: shows while off.
+        #: Whether powering down drops the fan to its slowest speed. The window unit
+        #: does not: powered down at speed 4 it reported 4 in three full reads from
+        #: 21.1s onwards, so the speed shown while off is the setting.
         self.parks_fan_when_off = parks_fan_when_off
         #: How many full reads a power-down takes before the fan parks, which is what
         #: the window unit's twenty-second turn-off timer looks like to a check that
@@ -289,7 +295,9 @@ class FakeUnit:
             self._moved.add("windlevel")
             return True
         if not self.wire["poweron"] and not self.keeps_settings_while_off:
-            # A unit that is off does not keep what it is told, and parks its fan.
+            # A unit that discards what it is told while off. Not what the window unit
+            # does, but firmware that behaves this way is what `_restore` would have to
+            # order its frames around, so the check has to be able to see it.
             if key == "poweron":
                 return False
             self._moved.add(key)
@@ -815,15 +823,21 @@ async def test_the_refusal_is_also_how_reconciliation_gets_exercised():
     assert "no override here to reconcile" in overridden.detail
 
 
-async def test_a_unit_that_keeps_settings_while_off_is_a_failure():
-    """`_restore` orders its frames on this, so the tool depends on it being true."""
-    _, results = await _run(FakeUnit(keeps_settings_while_off=True))
+async def test_a_unit_that_discards_settings_while_off_is_a_failure():
+    """A consumer writing to a unit that is off would be writing to nothing.
+
+    The window unit keeps the write, measured past the turn-off timer, so that is what
+    the claim says. Firmware that throws it away instead has to be reported rather than
+    quietly tolerated: it would make `_restore`'s frame order load-bearing again, and it
+    would make every control in the integration a no-op while the unit is off.
+    """
+    _, results = await _run(FakeUnit(keeps_settings_while_off=False))
     off = _one(results, "the_off_state_keeps_the_fan_speed_it_was_given")
     assert off.outcome == "fail"
-    assert "_restore is ordering its frames for no reason" in off.detail
+    assert "the write was discarded" in off.detail
     assert (
         off.measured["fan_speed_read_back_while_off"]
-        == off.measured["fan_speed_written_while_off"]
+        != off.measured["fan_speed_written_while_off"]
     )
 
 
@@ -852,16 +866,18 @@ async def test_a_power_down_that_takes_its_time_is_waited_out():
     The fan is still going for all of it, so a reading taken inside that window is of a
     unit shutting down and not of a unit that is off. The live run read at 5.5s and then
     at 12.1s and powered the unit back on at 12.7s, and reported a unit that does not
-    park its fan — from a fan that had not finished stopping. Both READMEs were changed
-    on that, and changed back.
+    park its fan — from a fan that had not finished stopping.
+
+    This fake parks on its second read, so a check that looked once would report exactly
+    what those runs reported, and be wrong for exactly their reason. Waiting the window
+    out finds the park, which for this claim is a failure.
     """
     assert POWER_DOWN > 20.0
-    _, results = await _run(FakeUnit(parks_after_reads=1))
+    _, results = await _run(FakeUnit(parks_after_reads=1, parks_fan_when_off=True))
     off = _one(results, "the_off_state_keeps_the_fan_speed_it_was_given")
 
-    assert off.outcome == "pass"
-    # The park lands on the second read, so the first one alone would have called this a
-    # unit that keeps its speed through a power-down.
+    assert off.outcome == "fail"
+    assert "it parks the fan" in off.detail
     assert off.measured["fan_speed_while_off"] == 1
 
 
@@ -1330,12 +1346,12 @@ async def test_the_off_state_check_asks_the_device_rather_than_its_own_optimism(
     Both halves are about a value the library sent and the device did not mention, so
     the merged state is this library quoting itself. Only a full re-read can settle it.
     """
-    transport = FakeUnit(keeps_settings_while_off=True)
+    transport = FakeUnit(keeps_settings_while_off=False)
     _, results = await _run(transport)
     off = _one(results, "the_off_state_keeps_the_fan_speed_it_was_given")
 
     assert off.outcome == "fail"
-    assert "_restore is ordering its frames for no reason" in off.detail
+    assert "the write was discarded" in off.detail
     # There has to be a full read after the last speed the check wrote, because that is
     # the value merged state would answer from the library's own optimism.
     frames = off.trace
@@ -1347,16 +1363,59 @@ async def test_the_off_state_check_asks_the_device_rather_than_its_own_optimism(
     assert any(frame["cmd"] == 3 for frame in frames[last_ack + 1 :])
 
 
-async def test_a_unit_that_does_not_park_the_fan_is_reported_too():
-    """The other half of the same claim, which the check used to measure and not assert.
+async def test_a_unit_that_parks_the_fan_is_reported_too():
+    """The other half of the same claim, and the half that reached the READMEs twice.
 
-    Both READMEs tell users that Low while off is the parked speed rather than a stale
-    reading. A unit that holds its running speed through a power-down makes that wrong —
-    but only if the reading was taken after the turn-off timer, which is why this fake
-    parks never rather than late.
+    Both now tell users that the speed shown while off is the setting, on three full
+    reads taken past the turn-off timer. Firmware that parks the fan instead makes that
+    wrong, and wrong in the direction where someone trusts a stale number, so it fails
+    rather than being noted.
     """
-    _, results = await _run(FakeUnit(holds_speed_zero=True, parks_fan_when_off=False))
+    _, results = await _run(FakeUnit(parks_fan_when_off=True))
     off = _one(results, "the_off_state_keeps_the_fan_speed_it_was_given")
 
     assert off.outcome == "fail"
-    assert "it does not park the fan" in off.detail
+    assert "it parks the fan" in off.detail
+
+
+@pytest.mark.parametrize("left_in", [Mode.DRY, Mode.FAN])
+async def test_a_check_cannot_strand_a_later_one_in_the_wrong_mode(left_in: Mode):
+    """Three thermal checks skip unless they are handed cool mode, and it was luck.
+
+    The liveness check that sends two conflicting commands and keeps whichever the
+    device answered with sends two *modes*, so the mode the suite left behind was the
+    outcome of a race. Run 2 left cool and all three ran; run 3 left dry and all three
+    skipped, reporting nothing about the claims they exist for — the suite lost a
+    quarter of its thermal coverage to the order two frames happened to arrive in.
+
+    So the mode is established between checks rather than hoped for, beside the
+    park that is there for the same reason. Asserted for every mode a check could leave
+    behind, because naming the one that bit is how the next one gets missed.
+    """
+    device = _device(FakeUnit())
+    await device.async_refresh()
+    runner = SelfTest(device, settle=0, max_wait=0, poll=0)
+    await device.async_set_mode(left_in)
+    assert device.state.mode is left_in
+    await runner._neutralise()
+    device.close()
+    assert device.state.mode is Mode.COOL
+
+
+async def test_the_between_check_reset_parks_the_setpoint_from_any_mode():
+    """The setpoint park used to be skipped unless the unit was already in cool.
+
+    Which made it the same bug one field over: a check that left dry mode also left the
+    setpoint wherever it was, so the next one inherited a running compressor. Parking
+    the mode first means the setpoint can always be parked too.
+    """
+    device = _device(FakeUnit())
+    await device.async_refresh()
+    runner = SelfTest(device, settle=0, max_wait=0, poll=0)
+    low, high = device.capabilities.target_temperature_range
+    await device.async_set_target_temperature(low)
+    await device.async_set_mode(Mode.FAN)
+    await runner._neutralise()
+    device.close()
+    assert device.state.mode is Mode.COOL
+    assert device.state.target_temperature == high

@@ -284,10 +284,29 @@ A third thing the runs found, and neither of them noticed, is that this unit tak
 twenty seconds to finish switching off, with the fan running for all of it. The off-state
 check read at 5.5 seconds and again at 12.1, and powered the unit back on at 12.7, so it
 never saw the unit off; both of its conclusions were about a fan that had not stopped yet,
-and one of them had reached both READMEs before the timer came up. It waits past the timer
-now, and what an off unit really reports is unmeasured. A check that reads a state the
-device takes time to reach has to be told how long that is — the deadline is not always the
-one you were thinking about.
+and one of them had reached both READMEs before the timer came up. A check that reads a
+state the device takes time to reach has to be told how long that is — the deadline is not
+always the one you were thinking about.
+
+The third run waited past the timer, and the answers are **no and yes**: powered down at
+speed 4 the unit reported 4 in three full reads from 21.1 seconds onwards, and a speed
+written 32 seconds after the power-off read back unchanged 31 seconds later. So the fan
+does not park, the speed shown while the unit is off is the setting rather than a parked
+value, and a setting written to a unit that is off is kept.
+
+Those two claims have now moved three times, so what makes this reading the one to trust is
+worth stating: every value in it was taken outside the shutdown window, and each conclusion
+rests on three `cmd:3` full reads rather than one. A probe before the first run had seen
+speeds written while off revert to the slowest; it recorded no timing, so it is presumed to
+have had the same defect.
+
+The same run found a fourth thing, which is a bug in the suite's shape rather than in a
+check. Three of the four thermal checks skip unless they are handed cool mode, and nothing
+was establishing it: the liveness check that sends two conflicting commands and keeps
+whichever the device answered with sends two *modes*, so the mode left behind was the
+outcome of a race. Run 2 left cool and all three ran; run 3 left dry and all three skipped.
+The between-check reset parks the mode now, beside the setpoint it already parked. A
+precondition a later check needs cannot be left to what an earlier one happened to do.
 
 Two checks deliberately bypass validation, and only these two: the setpoint and humidity
 ranges are probed one step past each end with a raw frame. Every other check can find a
