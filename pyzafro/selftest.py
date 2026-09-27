@@ -1633,7 +1633,7 @@ async def dry_mode_regulates_humidity_not_temperature(ctx: Context) -> None:
 
 @_check("thermal", "The runtime counter does not go backwards", cost=0)
 async def the_runtime_counter_is_monotonic(ctx: Context) -> None:
-    """Check the state class this library assigns `worktime`, and pin down its units.
+    """Check the state class this library assigns `worktime`: it must not go backwards.
 
     Nothing to do with how long the appliance has run. `total_increasing` is a promise
     *this library* makes on the device's behalf: Home Assistant will accept the readings
