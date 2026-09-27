@@ -148,8 +148,50 @@ _WIRE_TO_FIELD: Final[dict[str, str]] = {
 
 FIELD_TO_WIRE: Final[dict[str, str]] = {v: k for k, v in _WIRE_TO_FIELD.items()}
 
+#: The order control-frame keys are emitted in, and it is part of the protocol.
+#:
+#: The device applies a frame's keys in the order they appear, and some writes make it
+#: recalculate other fields: clearing `sleep` restores the speed the fan had before
+#: sleep, setting `extra` forces speed 3 and the lowest setpoint, setting `eco` forces
+#: speed 1 and a setpoint of 76. So a frame that both clears sleep and names a speed
+#: gets two different outcomes depending on key order, which is not something a JSON
+#: object ought to mean. Measured against a 90038EAC0-12K-ZAZ in cool mode, entering
+#: sleep from speed 2 and then asking for speed 3:
+#:
+#:     {"windlevel": 3, "sleep": false, ...}  -> device pushed windlevel 2. Lost.
+#:     {..., "sleep": false, "windlevel": 3}  -> no correction pushed. Kept.
+#:
+#: Hence the rule this order encodes: whatever the device derives from another field
+#: comes after the field it is derived from, so the later write wins and the caller's
+#: actual request is what survives. Most global first (power, then mode), then the
+#: programmes that move the fan and the setpoint, then the values they move.
+#:
+#: `sleep` precedes `extra` because only sleep's *clear* recalculates anything —
+#: leaving EXTRA was observed to push no speed at all — so this one order is right for
+#: both `{sleep: false, extra: true}` and `{sleep: true, extra: false}`.
+#:
+#: The app orders its one multi-key frame `{eco, extra, sleep, windlevel}`, which is
+#: also correct; it just never sends the two frames that need sleep before extra.
+_WIRE_ORDER: Final[tuple[str, ...]] = (
+    "poweron",
+    "mode",
+    "eco",
+    "sleep",
+    "extra",
+    "windlevel",
+    "templevel",
+    "rhlevel",
+    "oscset1",
+    "oscset2",
+    "muteon",
+    "lighton",
+    "childlockon",
+)
+
 #: The fan speed sleep mode selects. Reported, never commanded: it is not one of the
-#: positions the remote's fan button cycles, and the app never sends it.
+#: positions the remote's fan button cycles, and the app never sends it. Asking for it
+#: directly was acknowledged and then undone — a unit running at speed 2 was back at
+#: speed 2 five and a half seconds later — so sleep is the only way to this speed.
 SLEEP_FAN_SPEED: Final = 0
 
 #: Wire keys some device classes report that this library deliberately does not model
@@ -295,14 +337,29 @@ def _as_enum[T: IntEnum](enum_cls: type[T], value: Any) -> T | None:
 
 
 def build_command(fields: dict[str, Any]) -> dict[str, Any]:
-    """Translate DeviceState field names back into a wire `state` object."""
-    payload: dict[str, Any] = {}
+    """Translate DeviceState field names back into a wire `state` object.
+
+    Emitted in `_WIRE_ORDER`, never in the order the caller happened to build its dict,
+    because the device reads the keys in order and lets a later one override what an
+    earlier one made it recalculate. Ordering here rather than at each setter is what
+    stops a caller getting it wrong: there is one place a control frame is built, so
+    there is one place the order has to be right.
+
+    A key the order does not list is emitted after the ones it does, keeping the
+    caller's own order among them. That only happens for a field added to the model
+    without a thought about where it belongs, and last is where a new field is least
+    likely to be silently overridden.
+    """
+    unordered: dict[str, Any] = {}
     for field, value in fields.items():
         wire_key = FIELD_TO_WIRE.get(field)
         if wire_key is None:
             msg = f"unknown field {field!r}"
             raise KeyError(msg)
-        payload[wire_key] = int(value) if isinstance(value, IntEnum) else value
+        unordered[wire_key] = int(value) if isinstance(value, IntEnum) else value
+
+    payload = {key: unordered.pop(key) for key in _WIRE_ORDER if key in unordered}
+    payload.update(unordered)
     return payload
 
 

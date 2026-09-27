@@ -92,6 +92,19 @@ last two), and `async_set_sleep` and `async_set_extra` clear each other.
 EXTRA is the vendor's own name for it, on the unit's display and in the app; the app's
 code calls it `turbo` internally, and nothing here does.
 
+**Key order in a control frame is part of the protocol.** The device applies a frame's
+keys in the order they appear, and some writes make it recalculate others: clearing
+`sleep` restores the speed the fan had before sleep, setting `extra` forces speed 3 and
+the lowest setpoint, setting `eco` forces speed 1 and a setpoint of 76. So the same JSON
+object means two different things depending on the order its keys are written in —
+`{"windlevel": 3, "sleep": false}` leaves the fan at its old speed, and
+`{"sleep": false, "windlevel": 3}` leaves it at 3.
+
+The library emits a fixed order so that whatever the caller asked for is the last word,
+and the order the caller built its dict in is not something you have to think about.
+`async_send_raw` does not reorder anything, which is one more reason it is a diagnostic
+rather than a way to write state.
+
 **Fan speed `0` is not off, and cannot be asked for.** It is the speed sleep mode drops
 to, with the unit still running. Commanding it directly is acknowledged and then undone
 by the device about five seconds later, so it is absent from `fan_speeds`: `sleep` is the

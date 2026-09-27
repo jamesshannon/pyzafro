@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from pyzafro.models import (
+    _WIRE_ORDER,
+    FIELD_TO_WIRE,
+    READ_ONLY_FIELDS,
     DeviceState,
     Mode,
     Origin,
@@ -173,3 +176,46 @@ def test_device_list_is_grouped_by_room():
 
 def test_device_list_tolerates_a_flat_array():
     assert flatten_device_list([{"sn": "ABC", "vendor": "I4SEASON"}])[0]["sn"] == "ABC"
+
+
+def test_a_command_is_ordered_by_the_protocol_not_by_the_caller():
+    """Key order is wire semantics, so the caller's dict order must not reach the wire.
+
+    The device applies the keys in order and lets a later one override a field an
+    earlier one made it recalculate, so the thing being asked for has to come last.
+    """
+    payload = build_command(
+        {
+            "fan_speed": 3,
+            "target_temperature": 70,
+            "sleep": False,
+            "power": True,
+            "eco": False,
+            "mode": Mode.COOL,
+        }
+    )
+    assert list(payload) == [
+        "poweron",
+        "mode",
+        "eco",
+        "sleep",
+        "windlevel",
+        "templevel",
+    ]
+
+
+def test_every_field_that_can_be_commanded_has_a_place_in_the_order():
+    """The guard only guards fields it knows about, so it has to know about all of them.
+
+    A new writable field added without a thought about where it belongs is emitted last
+    by default, which is a guess. This is the test that makes someone make the decision.
+    """
+    commandable = set(FIELD_TO_WIRE) - READ_ONLY_FIELDS
+    placed = {FIELD_TO_WIRE[field] for field in commandable}
+    assert placed == set(_WIRE_ORDER)
+
+
+def test_a_field_with_no_place_in_the_order_is_emitted_last():
+    """The default for an unplaced key: last, where it can override but not be lost."""
+    payload = build_command({"fan_speed": 2, "filter_hours": 10, "mute": False})
+    assert list(payload) == ["windlevel", "muteon", "filterthr"]

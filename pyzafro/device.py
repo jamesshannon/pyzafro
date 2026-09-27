@@ -217,9 +217,15 @@ class ZafroDevice:
         it offers — eco forces 1, sleep forces 0 — so a lone `windlevel` can be undone
         a second after it lands.
 
-        The app publishes {windlevel, extra: false, sleep: false, eco: false} for every
+        The app publishes {eco: false, extra: false, sleep: false, windlevel} for every
         speed tap, and this mirrors it: asking for low means low. Only fields the model
         actually has are included, so nothing is sent that a device would reject.
+
+        The speed has to be the *last* key in that frame, because clearing sleep makes
+        the device restore the speed the fan had before sleep and it does so as it reads
+        that key. Sent first, the requested speed is silently replaced by the old one a
+        second later — which is the bug this ordering fixes. `build_command` guarantees
+        it, so the order this method builds its dict in does not matter.
 
         The side effects the device then applies itself — the setpoint eco was holding,
         the beeper sleep had muted — arrive as their own pushes, as always.
@@ -259,6 +265,9 @@ class ZafroDevice:
 
         Restricted to positions the model has, so nothing is sent that a device would
         have no field for.
+
+        Which key lands first matters — see `_WIRE_ORDER` — but not to this method:
+        `build_command` orders whatever it is given.
         """
         return {
             field: False
@@ -353,6 +362,10 @@ class ZafroDevice:
         capabilities are by definition unknown, and for testing a field this library
         refuses. Nothing is applied optimistically — whatever the device reports back
         is the only truth.
+
+        Key order is left exactly as given, unlike a real command (see `_WIRE_ORDER`),
+        because the order is itself a thing worth probing — it is how the sleep-exit
+        override was pinned down.
 
         Not for normal use. Prefer the typed setters.
         """

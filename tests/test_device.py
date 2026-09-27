@@ -724,3 +724,37 @@ def test_the_dump_says_how_old_the_signal_reading_is(device):
     assert dev.diagnostics()["base_info_age"] == pytest.approx(0.0, abs=1.0)
     # And still never carries the network name.
     assert "Shannon Family 5G" not in json.dumps(dev.diagnostics())
+
+
+async def test_a_speed_is_the_last_word_in_its_frame(device):
+    """Leaving sleep with a speed only works if the speed comes last.
+
+    The device reads a frame's keys in order. Clearing sleep makes it restore the speed
+    the fan had before sleep, so a `windlevel` ahead of that key is overwritten about a
+    second later and the fan ends up back where it was. Captured against a real unit:
+    entering sleep from speed 2 and asking for 3 with the speed first was answered with
+    a push back to 2, and with the speed last was not corrected at all.
+    """
+    dev, transport = device
+    dev.handle_frame(3, {**FULL_STATE, "sleep": True, "windlevel": 0})
+    await dev.async_set_fan_speed(3)
+
+    state = transport.published[-1]["data"]["state"]
+    assert list(state) == ["eco", "sleep", "extra", "windlevel"]
+
+
+async def test_entering_a_fan_position_states_it_after_leaving_the_other(device):
+    """The position being asked for is the last key, so nothing can undo it.
+
+    Only sleep's *clear* makes the device recalculate a speed — leaving EXTRA pushes no
+    speed at all — so sleep goes ahead of EXTRA either way round, and both frames end on
+    the field the caller actually asked about.
+    """
+    dev, transport = device
+    dev.handle_frame(3, {**FULL_STATE, "sleep": True, "windlevel": 0})
+
+    await dev.async_set_extra(on=True)
+    assert list(transport.published[-1]["data"]["state"]) == ["sleep", "extra"]
+
+    await dev.async_set_sleep(on=True)
+    assert list(transport.published[-1]["data"]["state"]) == ["sleep", "extra"]
