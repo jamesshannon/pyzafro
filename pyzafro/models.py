@@ -64,6 +64,11 @@ class DeviceState:
     swing_vertical: bool | None = None
     sleep: bool | None = None
     eco: bool | None = None
+    #: EXTRA, the fan's fifth position rather than a sixth `fan_speed` — the name the
+    #: unit's display and the app both use; the app's code calls it `turbo`. It is
+    #: reported alongside whatever speed the device decided to run it at, so it has to
+    #: be read before `fan_speed` to know what the fan is set to.
+    extra: bool | None = None
     mute: bool | None = None
     display: bool | None = None
     child_lock: bool | None = None
@@ -126,6 +131,10 @@ _WIRE_TO_FIELD: Final[dict[str, str]] = {
     "oscset2": "swing_horizontal",
     "sleep": "sleep",
     "eco": "eco",
+    # EXTRA, reached by holding the remote's fan button. The device answers with
+    # {"windlevel": 3, "extra": true} — a speed comes with it, so this cannot be read
+    # off windlevel alone.
+    "extra": "extra",
     "muteon": "mute",
     "lighton": "display",
     "childlockon": "child_lock",
@@ -139,6 +148,10 @@ _WIRE_TO_FIELD: Final[dict[str, str]] = {
 
 FIELD_TO_WIRE: Final[dict[str, str]] = {v: k for k, v in _WIRE_TO_FIELD.items()}
 
+#: The fan speed sleep mode selects. Reported, never commanded: it is not one of the
+#: positions the remote's fan button cycles, and the app never sends it.
+SLEEP_FAN_SPEED: Final = 0
+
 #: Wire keys some device classes report that this library deliberately does not model
 #: yet. Listed so that "we know about this and skipped it" can be told apart from "we
 #: have never seen this key before", which is the signal worth logging.
@@ -148,7 +161,6 @@ UNMODELLED_WIRE_KEYS: Final = frozenset(
         "timeroff",
         "oscset",
         "oscangle",
-        "extra",
         "auto",
         "humilevel",
         "lightmode",
@@ -180,6 +192,7 @@ _BOOL_FIELDS: Final = frozenset(
         "swing_vertical",
         "sleep",
         "eco",
+        "extra",
         "mute",
         "display",
         "child_lock",

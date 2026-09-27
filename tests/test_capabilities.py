@@ -18,9 +18,12 @@ def test_known_model_resolves():
     assert Mode.COOL in caps.modes
     # Heating never appeared on this cooling-only window unit.
     assert Mode.HEAT not in caps.modes
-    # 0 is the silent speed sleep selects, not "off".
-    assert caps.fan_speeds == (0, 1, 2, 3, 4)
+    # The remote's fan button cycles these four; 0 is reported while sleep runs and
+    # is not a position on that ring, so it is not offered.
+    assert caps.fan_speeds == (1, 2, 3, 4)
     assert caps.has(Feature.ECO)
+    # EXTRA is the long press on the same button, and its own key on the wire.
+    assert caps.has(Feature.EXTRA)
 
 
 def test_vendor_aliases_normalise():
@@ -90,5 +93,13 @@ def test_refinement_only_ever_subtracts():
         "mute",
         "swing_horizontal",
         "swing_vertical",
+        "extra",
     }
     assert known.refined(everything).features == known.features
+
+
+def test_an_unknown_air_conditioner_gains_extra_by_reporting_it():
+    """The fallback claims no EXTRA; a unit sending the key has demonstrated one."""
+    caps = resolve("SOMEAC-9000").refined({"mode", "fan_speed", "extra"})
+
+    assert caps.has(Feature.EXTRA)

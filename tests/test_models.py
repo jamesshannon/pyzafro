@@ -55,6 +55,18 @@ def test_parses_a_full_state_frame():
     assert state.temperature_unit is TemperatureUnit.FAHRENHEIT
     assert state.origin is Origin.DEVICE
     assert state.reached_target is False
+    assert state.extra is False
+
+
+def test_extra_rides_with_a_fan_speed():
+    """Captured from the remote's long press: the device reports both."""
+    state = DeviceState().merged(
+        parse_state({"windlevel": 3, "extra": True, "origin": 0}).updates
+    )
+
+    assert state.extra is True
+    assert state.fan_speed == 3
+    assert build_command({"extra": True}) == {"extra": True}
 
 
 def test_cmd4_deltas_merge_rather_than_replace():

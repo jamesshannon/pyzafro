@@ -32,6 +32,7 @@ from .exceptions import ZafroTimeoutError, ZafroUnsupportedError
 from .models import (
     BASE_INFO_WIRE_KEYS,
     READ_ONLY_FIELDS,
+    SLEEP_FAN_SPEED,
     BaseInfo,
     DeviceState,
     Mode,
@@ -207,13 +208,46 @@ class ZafroDevice:
         await self._async_command(target_humidity=int(value))
 
     async def async_set_fan_speed(self, level: int) -> None:
-        """Set fan speed. 0 is the silent speed sleep mode uses, not off."""
+        """Select a fan speed, and with it leave EXTRA, sleep and eco.
+
+        The only command that sends more than it was asked for, because the speeds are
+        not an independent axis. On the hardware they are one control: the remote's fan
+        button cycles 1-2-3-auto, holding it selects EXTRA, and pressing it again
+        returns to the cycle. The device also overrides the speed for two of the modes
+        it offers — eco forces 1, sleep forces 0 — so a lone `windlevel` can be undone
+        a second after it lands.
+
+        The app publishes {windlevel, extra: false, sleep: false, eco: false} for every
+        speed tap, and this mirrors it: asking for low means low. Only fields the model
+        actually has are included, so nothing is sent that a device would reject.
+
+        The side effects the device then applies itself — the setpoint eco was holding,
+        the beeper sleep had muted — arrive as their own pushes, as always.
+        """
         self._require(Feature.FAN_SPEED)
         if level not in self.capabilities.fan_speeds:
             raise ZafroUnsupportedError(
                 f"{self.name} fan speed must be one of {self.capabilities.fan_speeds}"
             )
-        await self._async_command(fan_speed=level)
+        fields: dict[str, Any] = {"fan_speed": level}
+        for feature, field in (
+            (Feature.EXTRA, "extra"),
+            (Feature.SLEEP, "sleep"),
+            (Feature.ECO, "eco"),
+        ):
+            if self.capabilities.has(feature):
+                fields[field] = False
+        await self._async_command(**fields)
+
+    async def async_set_extra(self, *, on: bool) -> None:
+        """Toggle EXTRA, the fan position beyond the top of the speed range.
+
+        Sent alone, like the app's own button. The device answers with the fan speed it
+        chose to run at — a real long press reported {"windlevel": 3, "extra": true} —
+        so `state.fan_speed` alone cannot tell you the fan is in EXTRA.
+        """
+        self._require(Feature.EXTRA)
+        await self._async_command(extra=on)
 
     async def async_set_swing(
         self, *, horizontal: bool | None = None, vertical: bool | None = None
@@ -628,9 +662,8 @@ class ZafroDevice:
 
         This is how a half-supported product announces itself: the model matched a
         family pattern, or fell back, and the guessed table is too narrow. It matters
-        because a consumer builds its UI from the capability table — Home Assistant
-        logs an error of its own when a device reports a fan speed that is not in the
-        list of speeds it was told to offer.
+        because a consumer builds its UI from the capability table, so a device doing
+        something the table forbids is a device whose controls are wrong.
         """
         caps = self.capabilities
         state = self.state
@@ -651,6 +684,9 @@ class ZafroDevice:
         speed = state.fan_speed
         if (
             speed is not None
+            # Sleep drops the fan to a speed that is on no dial and cannot be asked
+            # for. Reporting it is normal, not evidence of a table that is too narrow.
+            and speed != SLEEP_FAN_SPEED
             and caps.fan_speeds
             and speed not in caps.fan_speeds
             and self._note_drift(f"fan_speed={speed}")

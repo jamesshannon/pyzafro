@@ -6,7 +6,8 @@ genuinely new feature requires a consumer-side change (for Home Assistant, an en
 description and a translation).
 
 The feature vocabulary mirrors the app's own IOTDeviceFunction enum, which is the axis
-the manufacturer gates models on.
+the manufacturer gates models on — except where the manufacturer's own UI disagrees with
+its code, as it does for EXTRA, which that enum calls `turbo`.
 """
 
 from __future__ import annotations
@@ -30,7 +31,10 @@ class Feature(StrEnum):
 
     SLEEP = "sleep"
     ECO = "eco"
-    TURBO = "turbo"
+    #: The fan's fifth position. `IOTDeviceFunction` calls it `turbo` internally, but
+    #: every surface a user sees — the unit's display and the app's own button — says
+    #: EXTRA, and so does the wire key.
+    EXTRA = "extra"
     SWING_HORIZONTAL = "swing_horizontal"
     SWING_VERTICAL = "swing_vertical"
     FAN_SPEED = "fan_speed"
@@ -73,6 +77,7 @@ class BinarySensorKey(StrEnum):
 #: the table already describes.
 _FIELD_FEATURES: Final[dict[str, Feature]] = {
     "fan_speed": Feature.FAN_SPEED,
+    "extra": Feature.EXTRA,
     "swing_horizontal": Feature.SWING_HORIZONTAL,
     "swing_vertical": Feature.SWING_VERTICAL,
     "sleep": Feature.SLEEP,
@@ -220,23 +225,29 @@ _WINDOW_AC_SENSORS: Final = frozenset(
 
 #: Window air conditioner, cooling only.
 #:
-#: Confirmed live against 90038EAC0-12K-ZAZ: modes 1/2/3 (4 never appeared), fan speeds
-#: 0-4 where 0 is the silent speed sleep mode selects, whole-degree setpoints, sleep and
-#: eco independently
-#: settable.
+#: Confirmed live against 90038EAC0-12K-ZAZ: modes 1/2/3 (4 never appeared),
+#: whole-degree setpoints, sleep and eco both settable — though enabling eco was
+#: observed to clear sleep, so they are less independent than two switches suggest.
 #:
-#: The two ranges are NOT confirmed. Observed setpoints span 65-76F and the only
-#: humidity target ever seen is 50. They are set to the conventional range for a
-#: US window unit and should be tightened when someone hits a limit.
+#: The fan is one control with five positions: `windlevel` 1-4, which the remote's fan
+#: button cycles as three bars and auto, plus EXTRA, which is its own field rather than
+#: a speed and which the remote reaches by holding that button. `windlevel` 0 is absent
+#: because it is not one of those positions — it is what the device reports while sleep
+#: runs, and neither the remote nor the app can select it.
+#:
+#: The two ranges are NOT confirmed. Observed setpoints span 61-76F and the only
+#: humidity targets ever seen are 30 and 50. They are set to the conventional range for
+#: a US window unit and should be tightened when someone hits a limit.
 _WINDOW_AC = Capabilities(
     modes=frozenset({Mode.COOL, Mode.DRY, Mode.FAN}),
-    fan_speeds=(0, 1, 2, 3, 4),
+    fan_speeds=(1, 2, 3, 4),
     target_temperature_range=(60, 86),
     target_humidity_range=(30, 80),
     features=frozenset(
         {
             Feature.SLEEP,
             Feature.ECO,
+            Feature.EXTRA,
             Feature.SWING_HORIZONTAL,
             Feature.SWING_VERTICAL,
             Feature.FAN_SPEED,

@@ -110,6 +110,55 @@ async def test_setpoint_must_match_the_mode(device):
         await dev.async_set_target_humidity(50)
 
 
+async def test_a_speed_also_leaves_extra_and_what_overrides_it(device):
+    """The one command that pads, because the device fights anything less.
+
+    EXTRA and the four speeds are one control on the hardware, and the device forces
+    windlevel 1 under eco and 0 under sleep. The app publishes all four fields on every
+    speed tap; asking for low means low.
+    """
+    dev, transport = device
+    dev.handle_frame(3, {**FULL_STATE, "extra": True, "windlevel": 3})
+    await dev.async_set_fan_speed(1)
+
+    assert transport.published[0]["data"]["state"] == {
+        "windlevel": 1,
+        "extra": False,
+        "sleep": False,
+        "eco": False,
+    }
+    assert dev.state.extra is False
+
+
+async def test_extra_is_sent_alone(device):
+    """Like the app's own button. The device reports the speed it picked itself."""
+    dev, transport = device
+    dev.handle_frame(3, dict(FULL_STATE))
+    await dev.async_set_extra(on=True)
+
+    assert transport.published[0]["data"]["state"] == {"extra": True}
+    assert dev.state.extra is True
+
+    # Captured from a real long press: EXTRA arrives with windlevel 3, not a speed of
+    # its own.
+    dev.handle_frame(4, {"windlevel": 3, "extra": True, "origin": 0})
+    assert dev.state.fan_speed == 3
+    assert dev.state.extra is True
+
+
+async def test_the_sleep_fan_speed_is_not_capability_drift(device, caplog):
+    """The speed sleep reports is on no dial. Warning about it would fire nightly."""
+    dev, _ = device
+    dev.handle_frame(3, dict(FULL_STATE))
+    with caplog.at_level(logging.WARNING, logger="pyzafro.device"):
+        dev.handle_frame(
+            4, {"windlevel": 0, "sleep": True, "muteon": True, "origin": 0}
+        )
+
+    assert [r for r in caplog.records if "fan speed" in r.getMessage()] == []
+    assert dev.diagnostics()["anomalies"]["outside_capabilities"] == []
+
+
 async def test_commands_are_never_padded(device):
     dev, transport = device
     dev.handle_frame(3, {"mode": 3})
@@ -197,7 +246,7 @@ def test_known_but_unmodelled_keys_stay_quiet(device, caplog):
     """The timeron key is in every frame. Logging it would be pure noise."""
     dev, _ = device
     with caplog.at_level(logging.INFO, logger="pyzafro.device"):
-        dev.handle_frame(4, {"timeron": {"du": 0, "ts": 182}, "extra": False})
+        dev.handle_frame(4, {"timeron": {"du": 0, "ts": 182}, "oscangle": 30})
 
     assert caplog.records == []
     assert dev.diagnostics()["anomalies"]["unknown_keys"] == {}

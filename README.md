@@ -79,8 +79,19 @@ consequence the device has not reported.
 **Temperatures are in the device's own unit.** `DeviceState.temperature_unit` says which.
 Values are not normalised to Celsius; convert at the edge if you need to.
 
-**Fan speed `0` is not off.** It is the silent speed sleep mode selects, with the unit
-still running.
+**The fan is one control with five positions, not two axes.** `fan_speed` 1-4 are the
+positions the remote's fan button cycles — three bars and auto — and `extra`, reached by
+holding that button, is the fifth. It is a field of its own and comes back alongside a
+speed, so `state.extra` has to be read before `state.fan_speed` means anything.
+`async_set_fan_speed` leaves EXTRA, sleep and eco on the way past, the way the app does,
+because the device overrides the speed for the latter two.
+
+EXTRA is the vendor's own name for it, on the unit's display and in the app; the app's
+code calls it `turbo` internally, and nothing here does.
+
+**Fan speed `0` is not off, and cannot be asked for.** It is the speed sleep mode drops
+to, with the unit still running. It is reported but is on no dial, so it is absent from
+`fan_speeds`.
 
 ## The diagnostic tool
 
