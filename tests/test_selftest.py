@@ -105,6 +105,7 @@ class FakeUnit:
         judges_while_off: bool = False,
         runtime_step: int = 1,
         holds_speed_zero: bool = False,
+        reverts_speed_zero_after_reads: int = 1,
         keeps_settings_while_off: bool = True,
         parks_fan_when_off: bool = False,
         parks_after_reads: int = 0,
@@ -140,6 +141,15 @@ class FakeUnit:
         self.judges_while_off = judges_while_off
         self.runtime_step = runtime_step
         self.holds_speed_zero = holds_speed_zero
+        #: How many full reads it takes for speed 0 to come undone. The window unit
+        #: stores the 0, keeps reporting it, and lets the truth ride the next ambient
+        #: reading it was going to push anyway — 4.05s, 4.12s and 6.0s after the
+        #: acknowledgement across three runs — so one read is the default, because the
+        #: default unit is the one the hardware is. Zero instead corrects it in the
+        #: frame after the acknowledgement, the way a programme this unit means to
+        #: refuse comes back at 0.54s, which is the shape a settle can see.
+        self.reverts_speed_zero_after_reads = reverts_speed_zero_after_reads
+        self._undoing: tuple[int, Any] | None = None
         #: Whether a write to a unit that is off is kept. The window unit keeps it: a
         #: speed written 32s after a power-off read back unchanged 31s later. Both
         #: defaults here were the other way up until run 3 measured them past the
@@ -235,6 +245,7 @@ class FakeUnit:
             # moment a power-down still running its timer has had time to finish. Both
             # are functions of time rather than of anything commanded.
             self._tick()
+            self._finish_undoing()
             self._finish_parking()
             self._recompute()
             return [(3, self._stamp(dict(self.wire), 0))]
@@ -271,6 +282,10 @@ class FakeUnit:
             if self._refuses(key, asked_value):
                 continue
             self.wire[key] = self._clamp(key, asked_value)
+            if key == "windlevel" and self.wire[key]:
+                # A speed the unit accepted cancels a pending undo: it is running what
+                # it was last told, and the speed it would have gone back to is stale.
+                self._undoing = None
             if self.wire[key] != asked_value:
                 self._moved.add(key)
             left_sleep |= self._side_effects(key, self.wire[key], previous)
@@ -295,10 +310,16 @@ class FakeUnit:
             self._moved.add("mode")
             return True
         if key == "windlevel" and value == 0 and not self.holds_speed_zero:
-            # Acknowledged, then reverted a few seconds later. The speed sleep reports
-            # is not a speed that can be asked for.
-            self._moved.add("windlevel")
-            return True
+            # Acknowledged, then reverted. The speed sleep reports is not a speed that
+            # can be asked for — but a unit that takes its time about saying so has to
+            # be expressible, because that is the one the real hardware is.
+            if not self.reverts_speed_zero_after_reads:
+                self._moved.add("windlevel")
+                return True
+            self._undoing = (
+                self.reverts_speed_zero_after_reads,
+                self.wire["windlevel"],
+            )
         if not self.wire["poweron"] and not self.keeps_settings_while_off:
             # A unit that discards what it is told while off. Not what the window unit
             # does, but firmware that behaves this way is what `_restore` would have to
@@ -338,6 +359,22 @@ class FakeUnit:
             self._move("windlevel", 1)
             self._move("templevel", 76)
         return False
+
+    def _finish_undoing(self) -> None:
+        """Let a speed the unit never really took get as far as being contradicted.
+
+        A read at a time, for the reason `_finish_parking` gives: the fake has no clock,
+        and a check that waits for something the device sends on its own schedule is a
+        check that polls.
+        """
+        if self._undoing is None:
+            return
+        reads, speed = self._undoing
+        if reads > 1:
+            self._undoing = (reads - 1, speed)
+            return
+        self._undoing = None
+        self._move("windlevel", speed)
 
     def _finish_parking(self) -> None:
         """Let a power-down that takes a while get as far as parking the fan.
@@ -532,6 +569,39 @@ async def test_the_sleep_exit_check_would_have_caught_the_shipped_bug(monkeypatc
         if frame["cmd"] == 6 and "windlevel" in frame["data"]["state"]
     ]
     assert list(speed_frames[0]) == ["windlevel", "sleep", "extra", "eco"]
+
+
+async def test_a_unit_that_takes_its_time_undoing_speed_zero_is_not_failed_for_it():
+    """Run 4's only failure: a true claim, read six tenths of a second too early.
+
+    The device does not refuse speed 0 the way it refuses a programme. A refusal comes
+    back in the frame after the acknowledgement, at 0.54s in every run. This does not
+    come back at all: the 0 is stored, reported, and then quietly replaced on the next
+    ambient reading the unit was going to push anyway. Three runs measured 4.05s, 4.12s
+    and 6.0s against a settle reading the state at 5.4s, so the two passes before run 4
+    were luck and the failure was the check rather than the device — the very next check
+    saw the revert arrive.
+
+    The default unit takes a read to undo it, so this is also what the baseline covers;
+    named separately because the thing being asserted is that patience is not optional.
+    """
+    _, results = await _run(FakeUnit(reverts_speed_zero_after_reads=1))
+    refused = _one(results, "the_sleep_speed_is_refused_by_the_device")
+    assert refused.outcome == "pass"
+    assert refused.measured["speed_after_commanding_zero"] != 0
+
+
+async def test_a_unit_that_refuses_speed_zero_outright_also_passes():
+    """The other shape: corrected in the frame after the acknowledgement, at once.
+
+    Nothing has been seen doing this with a speed, but it is what every other refusal on
+    this protocol looks like, and a wait that only works when the device is slow would
+    be a strange thing to ship.
+    """
+    _, results = await _run(FakeUnit(reverts_speed_zero_after_reads=0))
+    refused = _one(results, "the_sleep_speed_is_refused_by_the_device")
+    assert refused.outcome == "pass"
+    assert refused.measured["seconds_to_undo"] == 0
 
 
 async def test_a_unit_that_holds_speed_zero_says_so():

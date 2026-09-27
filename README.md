@@ -106,9 +106,17 @@ and the order the caller built its dict in is not something you have to think ab
 rather than a way to write state.
 
 **Fan speed `0` is not off, and cannot be asked for.** It is the speed sleep mode drops
-to, with the unit still running. Commanding it directly is acknowledged and then undone
-by the device about five seconds later, so it is absent from `fan_speeds`: `sleep` is the
-way to that speed.
+to, with the unit still running. Commanding it directly is acknowledged and then undone,
+so it is absent from `fan_speeds`: `sleep` is the way to that speed.
+
+The undoing is worth a word, because it is not how this device turns anything else down.
+A value the unit means to refuse comes back corrected in the frame right after the
+acknowledgement — half a second, every time, in four runs. Speed `0` is not refused: it
+is stored, reported back as the current speed, and then quietly replaced by the speed the
+fan is really running, riding the next ambient reading the unit was going to push anyway.
+That took 4.05s, 4.12s and 6.0s across three runs, on nobody's schedule. So a consumer
+that reads the speed straight after writing one can see a `0` that is about to stop being
+true, and anything asserting the device does not keep it has to wait rather than sleep.
 
 ## The diagnostic tool
 

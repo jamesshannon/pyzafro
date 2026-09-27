@@ -58,11 +58,16 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-#: How long to let the device finish reacting before believing its state. The reactions
-#: that matter arrive 0.5-1.5s after the acknowledgement — the sleep-exit speed restore
-#: landed 1.1s after the command — and a programme flag the device means to refuse comes
-#: back up to 6s later. Six seconds covers both. Being generous costs a slower run;
-#: being tight costs a false pass.
+#: How long to let the device finish reacting before believing its state. A reaction the
+#: device *sends* — a refusal, a side effect, a correction it means to make — arrives in
+#: the frame right after the acknowledgement, 0.5-1.5s later: a refused programme flag
+#: came back at 0.54s in four runs, the sleep-exit speed restore at 1.1s. Six seconds is
+#: several times over that, and being generous only costs a slower run.
+#:
+#: What a settle cannot outlast is a correction the device never sends, which arrives
+#: whenever its next unsolicited broadcast happens to go out. That is `UNDO_WAIT`, and
+#: the difference between the two is the difference between a check that measures
+#: something and one that flips a coin.
 SETTLE = 6.0
 
 #: The ceiling on any single wait, and what `--max-wait` sets. It was called SOAK, for
@@ -93,6 +98,24 @@ POLL = 15.0
 #: fixed window rather than a pure deadline, because "the fan never parked" can only be
 #: concluded once the window has closed.
 POWER_DOWN = 25.0
+
+#: The deadline for a value the device acknowledges and then contradicts, which is a
+#: different thing from one it refuses. Asked for fan speed 0 the unit says 0, keeps
+#: saying 0, and then reports the speed it is really running — not in a correcting frame
+#: of its own, but riding the next ambient reading it was going to push anyway. Those
+#: come about every 5s and on nobody's schedule, so the wait has to be a deadline: the
+#: revert landed 4.05s after the acknowledgement in run 2, 4.12s in run 3 and 6.0s in
+#: run 4, where a settle read the state 0.6s too early and called a true claim false.
+#:
+#: Generous, because the tail is unbounded and a deadline costs nothing when the device
+#: answers. The healthy case now ends sooner than the settle it replaced.
+UNDO_WAIT = 30.0
+
+#: How often to ask while waiting for a contradiction. Far finer than `POLL`, because
+#: here the latency is itself the measurement and a fifteen-second poll would round
+#: every answer to fifteen seconds. Each poll is a full read, so this also answers the
+#: question a push cannot: whether the device was holding the value all along.
+UNDO_POLL = 2.0
 
 #: The deadline for `reachtarget`, which is a comparison the MCU makes rather than
 #: something the room has to do, so it should flip within seconds of the setpoint moving
@@ -240,6 +263,7 @@ class Context:
         ready: Callable[[], bool],
         *,
         timeout: float | None = None,
+        poll: float | None = None,
     ) -> float | None:
         """Wait for `ready`, and stop waiting the moment it is true.
 
@@ -255,8 +279,12 @@ class Context:
         Each poll re-reads full state. The device does push ambient readings unprompted,
         but nothing guarantees one lands inside the deadline, and waiting on a push that
         never comes would fail a working unit.
+
+        `poll` overrides the interval for a wait whose answer is expected in seconds
+        rather than minutes, where the default would round the measurement to the poll.
         """
         deadline = self.max_wait_seconds if timeout is None else timeout
+        interval = self.poll_seconds if poll is None else poll
         started = time.monotonic()
         polled = False
         while True:
@@ -266,7 +294,7 @@ class Context:
             if polled and elapsed >= deadline:
                 return None
             polled = True
-            await asyncio.sleep(max(0.0, min(self.poll_seconds, deadline - elapsed)))
+            await asyncio.sleep(max(0.0, min(interval, deadline - elapsed)))
             with contextlib.suppress(Exception):
                 await self.device.async_refresh()
 
@@ -274,6 +302,44 @@ class Context:
         """Issue one real command, then wait before believing anything about it."""
         await awaitable
         await self.settle()
+
+    async def undone(
+        self,
+        reading: Callable[[], object],
+        *,
+        was: object,
+    ) -> float | None:
+        """Wait for the device to contradict a value it acknowledged, and time it.
+
+        For the claims of the form "the device will not hold that": the value goes out,
+        the device acknowledges it, and the truth follows separately. A settle is the
+        wrong instrument for all of them, because it decides the device never answered
+        by not having heard from it yet — which is how the check on fan speed 0 failed a
+        true claim in run 4 by six tenths of a second.
+
+        Returns the seconds the device took, or None if it kept the value for the whole
+        of `UNDO_WAIT`, which is the only reading that means it really does hold it.
+        None is the failure and the caller says what it would mean; the number is worth
+        recording either way, because a refusal and a contradiction are an order of
+        magnitude apart and which one this is tells a consumer whether the device
+        rejected the value or merely never stored it.
+
+        Settles before waiting, and that part is not an optimisation. `until` asks
+        whether the value has changed before it yields, and a value the device has not
+        acknowledged yet has not changed either — so without the settle every one of
+        these reads the state from before the command and reports that the device undid
+        something it had not yet been told. Two tests caught exactly that. A settle is
+        the established way to let an acknowledgement land, so the wait starts after one
+        and the returned figure counts from before it.
+        """
+        started = time.monotonic()
+        await self.settle()
+        taken = await self.until(
+            lambda: reading() != was,
+            timeout=min(UNDO_WAIT, self.max_wait_seconds),
+            poll=UNDO_POLL,
+        )
+        return None if taken is None else time.monotonic() - started
 
     @contextlib.asynccontextmanager
     async def frames(self) -> AsyncIterator[list[dict[str, Any]]]:
@@ -524,6 +590,13 @@ async def the_sleep_speed_is_refused_by_the_device(ctx: Context) -> None:
     optimistically, so whatever the state says afterwards is the device's own answer.
     The last version of this measurement was taken with the unit off, where every speed
     reverts, and the conclusion survived a re-run only by luck. Hence a check.
+
+    Waited out rather than settled for, because the contradiction does not come in a
+    frame of its own. The device acknowledges 0, holds it, and then reports the real
+    speed on the back of the next ambient reading it was going to push anyway — 4.05s,
+    4.12s and 6.0s after the acknowledgement in three runs, against a settle that read
+    at 5.4s. Run 4 read 0, failed a true claim, and the very next check saw the revert
+    0.6s later. Two passes before it were luck, not evidence.
     """
     ctx.requires(Feature.FAN_SPEED)
     if SLEEP_FAN_SPEED in ctx.caps.fan_speeds:
@@ -536,11 +609,16 @@ async def the_sleep_speed_is_refused_by_the_device(ctx: Context) -> None:
     held = ctx.slowest_speed()
     await ctx.command(ctx.device.async_set_fan_speed(held))
     await ctx.device.async_send_raw({FIELD_TO_WIRE["fan_speed"]: SLEEP_FAN_SPEED})
-    await ctx.settle()
-    ctx.note(speed_after_commanding_zero=ctx.state.fan_speed)
+    taken = await ctx.undone(lambda: ctx.state.fan_speed, was=SLEEP_FAN_SPEED)
+    ctx.note(
+        speed_after_commanding_zero=ctx.state.fan_speed,
+        seconds_to_undo=taken and round(taken, 1),
+        waited=round(min(UNDO_WAIT, ctx.max_wait_seconds), 1),
+    )
     ctx.expect(
-        ctx.state.fan_speed != SLEEP_FAN_SPEED,
-        f"the device held fan speed {SLEEP_FAN_SPEED} when asked for it directly, so "
+        taken is not None,
+        f"the device held fan speed {SLEEP_FAN_SPEED} for the whole of "
+        f"{min(UNDO_WAIT, ctx.max_wait_seconds):.0f}s when asked for it directly, so "
         f"it is a real speed after all and belongs in fan_speeds",
     )
 
@@ -1112,7 +1190,7 @@ async def the_setpoint_range_is_not_too_narrow(ctx: Context) -> None:
     try:
         for beyond in (low - 1, high + 1):
             await ctx.device.async_send_raw({wire: beyond})
-            await ctx.settle()
+            await ctx.undone(lambda: ctx.state.target_temperature, was=beyond)
             got = ctx.state.target_temperature
             ctx.note(**{f"setpoint_{beyond}_became": got})
             if got == beyond:
@@ -1183,7 +1261,7 @@ async def the_humidity_range_is_accepted(ctx: Context) -> None:
         accepted = []
         for beyond in (low - 1, high + 1):
             await ctx.device.async_send_raw({wire: beyond})
-            await ctx.settle()
+            await ctx.undone(lambda: ctx.state.target_humidity, was=beyond)
             ctx.note(**{f"humidity_{beyond}_became": ctx.state.target_humidity})
             if ctx.state.target_humidity == beyond:
                 accepted.append(beyond)
@@ -1398,9 +1476,13 @@ async def an_overridden_command_ends_up_at_the_devices_answer(ctx: Context) -> N
     try:
         await ctx.device.async_set_sleep(on=True)
         optimistic = ctx.state.sleep
-        await ctx.settle()
+        taken = await ctx.undone(lambda: ctx.state.sleep, was=True)
         settled = ctx.state.sleep
-        ctx.note(sleep_optimistic=optimistic, sleep_settled=settled)
+        ctx.note(
+            sleep_optimistic=optimistic,
+            sleep_settled=settled,
+            seconds_to_undo=taken and round(taken, 1),
+        )
         ctx.expect(
             optimistic is True,
             f"the library did not apply sleep optimistically at all (it read "
