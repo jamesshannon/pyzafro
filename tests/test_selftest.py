@@ -15,9 +15,11 @@ from typing import Any
 
 import pytest
 
-from pyzafro.capabilities import Feature
+from pyzafro.capabilities import Feature, resolve
 from pyzafro.device import ZafroDevice
 from pyzafro.selftest import (
+    CHECKS,
+    REACH_WAIT,
     SUITES,
     Check,
     CheckFailedError,
@@ -87,17 +89,22 @@ class FakeUnit:
         deferred_restore: bool = False,
         minimal: bool = False,
         model: str = RAW["model"],
-        real_temp_range: tuple[int, int] = (60, 86),
-        real_humidity_range: tuple[int, int] = (30, 80),
+        # What the device really accepts, defaulting to what the table now claims after
+        # a live run tightened it. A fake whose real limits are wider than the table's
+        # is a fake reporting the table too narrow, which is a finding, not a baseline.
+        real_temp_range: tuple[int, int] = (61, 86),
+        real_humidity_range: tuple[int, int] = (30, 70),
         refuses_modes: frozenset[int] = frozenset(),
         ambient_humidity: int = 40,
         ambient_temperature: int = 75,
         cools: bool = True,
-        dehumidifies: bool = True,
+        regulates_humidity: bool = True,
         tracks_target: bool = True,
         runtime_step: int = 1,
         holds_speed_zero: bool = False,
         keeps_settings_while_off: bool = False,
+        parks_fan_when_off: bool = True,
+        ambient_already_falling: bool = False,
         allows_programmes_in_fan_mode: bool = False,
         reports_origin: bool = True,
         silent_keys: tuple[str, ...] = (),
@@ -122,11 +129,18 @@ class FakeUnit:
         self.real_humidity_range = real_humidity_range
         self.refuses_modes = refuses_modes
         self.cools = cools
-        self.dehumidifies = dehumidifies
+        self.regulates_humidity = regulates_humidity
         self.tracks_target = tracks_target
         self.runtime_step = runtime_step
         self.holds_speed_zero = holds_speed_zero
         self.keeps_settings_while_off = keeps_settings_while_off
+        #: Whether powering down drops the fan to its slowest speed, which the
+        #: integration's README tells users is why Low shows while off.
+        self.parks_fan_when_off = parks_fan_when_off
+        #: A room already on its way down before anything is commanded, which is what a
+        #: check that cooled just before this one leaves behind.
+        self.ambient_already_falling = ambient_already_falling
+        self._drift = -1
         self.allows_programmes_in_fan_mode = allows_programmes_in_fan_mode
         self.reports_origin = reports_origin
         #: Wire keys this unit drops in total silence: no acknowledgement and no
@@ -202,8 +216,12 @@ class FakeUnit:
     def _replies_to(self, payload: dict[str, Any]) -> list[tuple[int, dict[str, Any]]]:
         cmd = payload["cmd"]
         if cmd == 3:
-            # A full read is also the moment a real unit's counters have advanced.
+            # A full read is also the moment a real unit's counters have advanced, and
+            # the moment a room that is moving on its own has moved. Both are functions
+            # of time rather than of anything commanded, so neither waits for a command.
             self._tick()
+            self._drift_ambient()
+            self._recompute()
             return [(3, self._stamp(dict(self.wire), 0))]
         if cmd == 5:
             return [
@@ -278,7 +296,8 @@ class FakeUnit:
     def _side_effects(self, key: str, value: Any, previous: Any) -> bool:
         """Apply what the unit does off its own bat. Returns whether sleep was left."""
         if key == "poweron" and not value:
-            self._move("windlevel", _OFF_SPEED)
+            if self.parks_fan_when_off:
+                self._move("windlevel", _OFF_SPEED)
         elif key == "sleep" and value and not previous:
             self._saved_speed = self.wire["windlevel"]
             self._move("windlevel", 0)
@@ -291,8 +310,8 @@ class FakeUnit:
         elif key == "extra" and value:
             self._move("windlevel", 3)
             self._move("sleep", value=False)
-            # Observed once at 61, a degree above the claimed floor of 60.
-            self._move("templevel", self.real_temp_range[0] + 1)
+            # Observed at 61, which a later run established is the real floor.
+            self._move("templevel", self.real_temp_range[0])
         elif key == "eco" and value:
             self._move("windlevel", 1)
             self._move("templevel", 76)
@@ -307,6 +326,8 @@ class FakeUnit:
         """
         if not self.wire["poweron"]:
             return
+        if self.ambient_already_falling:
+            return
         floor = max(self.wire["templevel"], self.real_temp_range[0])
         if (
             self.cools
@@ -314,13 +335,19 @@ class FakeUnit:
             and self.wire["temperature"] > floor
         ):
             self._move("temperature", self.wire["temperature"] - 1)
-        dry_floor = max(self.wire["rhlevel"], self.real_humidity_range[0])
-        if (
-            self.dehumidifies
-            and self.wire["mode"] == DRY
-            and self.wire["rh"] > dry_floor
-        ):
-            self._move("rh", self.wire["rh"] - 1)
+
+    def _drift_ambient(self) -> None:
+        """Move a room that is already moving, whatever was or was not commanded.
+
+        Never still, the way a room is for a while after the check before this one
+        stopped cooling it. It alternates rather than running away, because a reading
+        that left the setpoint range would skip for that reason instead — and because
+        the live unit's humidity reading really does flap between two integers.
+        """
+        if not self.ambient_already_falling:
+            return
+        self._move("temperature", self.wire["temperature"] + self._drift)
+        self._drift = -self._drift
 
     def _tick(self) -> None:
         """Advance the runtime counter, which a full read is a chance to notice."""
@@ -333,10 +360,17 @@ class FakeUnit:
             return
         if not self.tracks_target:
             return
-        reached = (
-            self.wire["mode"] != COOL
-            or self.wire["temperature"] <= self.wire["templevel"]
-        )
+        # Which setpoint the thermostat watches depends on the mode, which is the live
+        # unit's behaviour and the evidence that dry mode is the humidity mode: the
+        # temperature target stayed satisfied across the change and reachtarget still
+        # went out. A fake that called dry mode reached whatever the humidity was doing
+        # would pass that check without the device having to do anything.
+        if self.wire["mode"] == COOL:
+            reached = self.wire["temperature"] <= self.wire["templevel"]
+        elif self.wire["mode"] == DRY and self.regulates_humidity:
+            reached = self.wire["rh"] <= self.wire["rhlevel"]
+        else:
+            reached = True
         if reached != self.wire["reachtarget"]:
             self._move("reachtarget", reached)
 
@@ -743,12 +777,27 @@ async def test_requiring_an_absent_feature_skips_with_its_name():
 # --- the protocol claims a consumer has been told to expect -------------------------
 
 
-async def test_a_unit_that_keeps_a_programme_in_fan_mode_is_a_failure():
-    """Both READMEs promise the unit refuses these, so a unit that does not is news."""
+async def test_a_unit_that_keeps_sleep_in_fan_mode_is_a_failure():
+    """Both READMEs promise the unit refuses sleep, so a unit that does not is news."""
     _, results = await _run(FakeUnit(allows_programmes_in_fan_mode=True))
-    refused = _one(results, "a_cooling_programme_is_refused_in_fan_mode")
+    refused = _one(results, "sleep_is_refused_in_fan_mode")
     assert refused.outcome == "fail"
-    assert "the READMEs say" in refused.detail
+    assert "both READMEs say" in refused.detail
+
+
+async def test_extra_and_eco_in_fan_mode_are_recorded_without_a_verdict():
+    """A live run found fan mode keeping both, and nothing here depends on the answer.
+
+    They used to be asserted alongside sleep on the reasoning that all three are cooling
+    programmes. That was a guess about the device's reasoning, the device disagreed, and
+    a claim this library does not rely on should not be able to fail a run.
+    """
+    _, results = await _run(FakeUnit(allows_programmes_in_fan_mode=True))
+    refused = _one(results, "sleep_is_refused_in_fan_mode")
+
+    assert refused.measured["extra_in_fan_mode"] is True
+    assert refused.measured["eco_in_fan_mode"] is True
+    assert "extra" not in refused.detail
 
 
 async def test_the_refusal_is_also_how_reconciliation_gets_exercised():
@@ -793,14 +842,14 @@ async def test_an_extra_setpoint_outside_the_table_proves_the_table_wrong():
     _, results = await _run(FakeUnit(real_temp_range=(50, 86)))
     extra = _one(results, "extra_moves_the_setpoint_within_the_claimed_range")
     assert extra.outcome == "fail"
-    assert "outside the table's 60-86" in extra.detail
+    assert "outside the table's 61-86" in extra.detail
 
 
 # --- the assumptions the table only guesses at --------------------------------------
 
 
 async def test_a_clamped_setpoint_bound_names_the_real_limit():
-    """The whole point of walking the range: 60-86 ships as an invention.
+    """The whole point of walking the range: the bounds shipped as an invention.
 
     A unit that clamps is a unit whose real limits differ from the table's, and the
     value it clamps to is the number the table should carry — so the failure has to say
@@ -815,14 +864,16 @@ async def test_a_clamped_setpoint_bound_names_the_real_limit():
 async def test_a_range_the_device_exceeds_is_reported_as_too_narrow():
     """The direction no other check can see, because the library refuses it first.
 
-    A unit that accepts 59 would never be asked for it, so its owner would simply never
-    be offered a setting their hardware has. Only a raw frame can find that.
+    A unit that accepts 60 would never be asked for it, so its owner would simply never
+    be offered a setting their hardware has. Only a raw frame can find that — and the
+    live run vindicated it from the other side: the table claimed 60, the device clamped
+    that to 61, so one guess was wrong in both directions at once.
     """
     _, results = await _run(FakeUnit(real_temp_range=(50, 90)))
     narrow = _one(results, "the_setpoint_range_is_not_too_narrow")
     assert narrow.outcome == "fail"
     assert "the table is too narrow" in narrow.detail
-    assert "59" in narrow.detail
+    assert "60" in narrow.detail
 
 
 async def test_the_humidity_range_is_always_tested_now():
@@ -835,7 +886,7 @@ async def test_the_humidity_range_is_always_tested_now():
     # It really did go to dry mode and command both ends, then come back.
     asked = [f["data"]["state"] for f in transport.published if f["cmd"] == 6]
     assert {"rhlevel": 30} in asked
-    assert {"rhlevel": 80} in asked
+    assert {"rhlevel": 70} in asked
     assert transport.wire["mode"] == COOL
 
 
@@ -857,7 +908,10 @@ async def test_an_excursion_leaves_the_setpoint_satisfied_behind_it():
     device.close()
 
     asked = [f["data"]["state"] for f in transport.published if f["cmd"] == 6]
-    low = max(i for i, frame in enumerate(asked) if frame.get("templevel") == 60)
+    bounds = resolve(RAW["model"]).target_temperature_range
+    assert bounds is not None
+    floor = bounds[0]
+    low = max(i for i, frame in enumerate(asked) if frame.get("templevel") == floor)
     after = [f for f in asked[low + 1 :] if "templevel" in f]
     assert after, "nothing reset the setpoint after the excursion"
     assert after[0]["templevel"] == 86
@@ -939,15 +993,45 @@ async def test_the_failure_says_which_of_its_two_causes_is_in_scope():
 
 
 async def test_a_humidity_target_the_device_only_stores_is_a_failure():
-    """Two claims with one wait: the mode number, and whether `rhlevel` drives anything.
+    """Two claims at once: the mode number, and whether `rhlevel` drives anything.
 
     If the device merely stores the number, `target_humidity` is a control that does
     nothing and should not be offered at all.
     """
-    _, results = await _run(FakeUnit(ambient_humidity=90, dehumidifies=False))
-    dry = _one(results, "dry_mode_is_the_mode_that_dehumidifies")
+    _, results = await _run(FakeUnit(ambient_humidity=90, regulates_humidity=False))
+    dry = _one(results, "dry_mode_regulates_humidity_not_temperature")
     assert dry.outcome == "fail"
     assert "should not be offered" in dry.detail
+
+
+async def test_dry_mode_is_read_from_the_thermostat_not_from_the_room(unit):
+    """The comparator answers in seconds what three minutes of physics could not.
+
+    The temperature target stays satisfied across the mode change, so a thermostat that
+    goes unsatisfied anyway is comparing something else — and `rhlevel` is the only
+    other setpoint the device has.
+    """
+    _, results = await _run(unit)
+    dry = _one(results, "dry_mode_regulates_humidity_not_temperature")
+
+    assert dry.outcome == "pass", dry.detail
+    assert dry.measured["reached_target_with_temperature_satisfied"] is True
+    assert dry.measured["reached_target_in_dry"] is False
+    assert dry.measured["reached_target_with_humidity_satisfied"] is True
+
+
+async def test_the_dry_check_no_longer_waits_on_the_room():
+    """It used to soak for three minutes and failed a unit that was working.
+
+    The reading flaps between two adjacent integers, so the noise band is the size of
+    the change, and the old check asked for a fall past it. What is left is budgeted
+    against the MCU comparing two numbers instead.
+    """
+    dry = next(c for c in CHECKS if c.suite == "thermal" and "dry_mode" in c.name)
+
+    assert dry.soaks == 0
+    assert dry.reaches == 1
+    assert REACH_WAIT < 180.0
 
 
 async def test_a_reached_target_that_never_moves_is_a_constant_with_a_name():
@@ -973,7 +1057,10 @@ async def test_a_runtime_counter_too_coarse_to_move_is_a_skip_not_a_pass():
     _, results = await _run(FakeUnit(runtime_step=0))
     runtime = _one(results, "the_runtime_counter_advances")
     assert runtime.outcome == "skip"
-    assert "coarser than that" in runtime.detail
+    # And it says what the flat reading did settle, because a counter too coarse to
+    # catch is what hours predicts and is not what seconds or minutes would look like.
+    assert "rules out seconds and minutes" in runtime.detail
+    assert runtime.measured["units_finer_than_the_deadline"] is False
 
 
 async def test_the_runtime_check_is_about_the_state_class_not_the_appliance():
@@ -1076,3 +1163,108 @@ async def test_a_write_the_device_never_answers_leaves_a_field_pending():
     assert noop.outcome == "fail"
     assert "every redundant write" in noop.detail
     assert noop.measured["pending_after_a_no_op"] == ["mute"]
+
+
+# --- what a live run found the checks themselves getting wrong ----------------------
+
+
+async def test_a_dud_switch_does_not_hide_the_switches_behind_it():
+    """A live run stopped at the first bad feature and never reached the rest.
+
+    The table claimed a display switch the device ignores; the check aborted there, so
+    mute went untested and the run could not say whether it worked. One run
+    should name everything wrong with the table, not the first thing.
+    """
+    _, results = await _run(FakeUnit(ignores=("muteon", "childlockon")))
+    features = _one(results, "every_claimed_feature_is_accepted")
+
+    assert features.outcome == "fail"
+    assert "mute" in features.detail
+    assert "child_lock" in features.detail
+    # And every claim it walked is reported, so a reader can see what was reached.
+    assert features.measured["mute_accepted"] is False
+    assert features.measured["child_lock_accepted"] is False
+    assert features.measured["swing_vertical_accepted"] is True
+
+
+async def test_a_clamped_bound_does_not_hide_the_narrowness_probe_behind_it():
+    """Same bug, same run: the humidity clamp check aborted before the raw probe.
+
+    The two halves look for opposite faults, so the first one failing is the worst time
+    to skip the second.
+    """
+    _, results = await _run(FakeUnit(ambient_humidity=90, real_humidity_range=(20, 60)))
+    humidity = _one(results, "the_humidity_range_is_accepted")
+
+    assert humidity.outcome == "fail"
+    # Too wide at the top, and too narrow at the bottom, from one run.
+    assert "is the real limit" in humidity.detail
+    assert "too narrow" in humidity.detail
+    assert humidity.measured["humidity_29_became"] == 29
+
+
+async def test_a_deferred_failure_outranks_a_later_skip():
+    """A check that walks past a failure and then gives up has still found one."""
+    ctx = Context(_device(FakeUnit()), settle=0, soak=0, poll=0)
+
+    async def walks_then_skips(_ctx: Context) -> None:
+        _ctx.expect_but_continue(condition=False, detail="the first claim was wrong")
+        raise CheckSkippedError("and then there was nothing more to do")
+
+    check = Check(
+        name="walks_then_skips",
+        suite="protocol",
+        claim="Walking past a failure is not forgiving it",
+        run=walks_then_skips,
+        cost=0,
+    )
+    runner = SelfTest(ctx.device, settle=0, soak=0, poll=0)
+    runner._context = ctx
+    result = await runner._run_one(check)
+    ctx.device.close()
+
+    assert result.outcome == "fail"
+    assert result.detail == "the first claim was wrong"
+
+
+async def test_the_off_state_check_asks_the_device_rather_than_its_own_optimism():
+    """A live run read back its own optimistic write and called it the device's answer.
+
+    Both halves are about a value the library sent and the device did not mention, so
+    the merged state is this library quoting itself. Only a full re-read can settle it.
+    """
+    transport = FakeUnit(keeps_settings_while_off=True)
+    _, results = await _run(transport)
+    off = _one(results, "the_unit_off_is_not_a_state_settings_survive")
+
+    assert off.outcome == "fail"
+    assert "_restore is ordering its frames for no reason" in off.detail
+    # Its own trace has to carry the full-state replies, one per reading it took. A
+    # merged-state read would answer from the library's optimism and never ask.
+    assert sum(frame["cmd"] == 3 for frame in off.trace) == 2
+
+
+async def test_a_unit_that_does_not_park_the_fan_is_reported_too():
+    """The other half of the same claim, which the check used to measure and not assert.
+
+    The integration's README tells users that Low while off is the real setting. A unit
+    that keeps speed 4 while off makes that advice wrong, and the live run found one.
+    """
+    _, results = await _run(FakeUnit(holds_speed_zero=True, parks_fan_when_off=False))
+    off = _one(results, "the_unit_off_is_not_a_state_settings_survive")
+
+    assert off.outcome == "fail"
+    assert "does not park the fan" in off.detail
+
+
+async def test_a_fall_the_command_cannot_be_credited_with_is_not_a_pass():
+    """The live run passed this in 0.0 seconds, off a reading already on its way down.
+
+    Cooling left over from the check before says nothing about what mode 1 means, and a
+    check that accepts it would pass a unit with the enum shuffled.
+    """
+    _, results = await _run(FakeUnit(ambient_already_falling=True))
+    cooling = _one(results, "cool_mode_is_the_mode_that_cools")
+
+    assert cooling.outcome == "skip"
+    assert "before this check commanded anything" in cooling.detail

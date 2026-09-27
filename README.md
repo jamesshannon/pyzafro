@@ -163,7 +163,7 @@ where the bugs have actually been.
 
 This is the full integration suite, not a smoke test. It is meant to be run rarely and
 deliberately — once before a release, or after a bug that got past the unit tests — and it
-is thorough in preference to quick or gentle. Twenty-five minutes at worst, usually much
+is thorough in preference to quick or gentle. Twenty minutes at worst, usually much
 less, and it runs the machine.
 
 | suite | checks | what it exercises |
@@ -176,9 +176,10 @@ less, and it runs the machine.
 
 Selectable and repeatable with `--suite`, all of them by default. The first four take
 about twelve minutes between them and never leave the thermostat unsatisfied for more than
-a settle. `thermal` is all of the electricity and most of the clock: each of its four waits
-ends the moment the unit has responded and gives up after `--soak` (three minutes), so the
-printed estimate is a ceiling and a healthy unit finishes well inside it.
+a settle. `thermal` is all of the electricity and most of the clock: each of its waits ends
+the moment the unit has responded, and gives up either after `--soak` (three minutes) or
+after a minute where what it is waiting for is the MCU comparing two numbers it already
+has. So the printed estimate is a ceiling, and a healthy unit finishes well inside it.
 
 **It runs the machine.** It prints what it will change, asks before starting, and restores
 every field afterwards — including after a failure or a Ctrl-C — then re-reads the device
@@ -196,15 +197,24 @@ other suite arranges.
 would pass with the enum shuffled: commanding mode 1 and reading mode 1 back proves the
 device accepts the number, never that the number means cooling. `Mode` labels the entire
 HVAC dropdown, so a mislabelled member puts "Cool" on the button that dehumidifies and
-nothing reports an error. The only instrument for reading what a mode number means is the
-direction the room moves. Likewise `reachtarget`, which gets a binary sensor named after a
-behaviour nobody has watched it perform, and `worktime`, which ships as `total_increasing`
-— a promise this library makes on the device's behalf that Home Assistant will read a
-decrease as a meter reset.
+nothing reports an error. For cool the only instrument is the direction the room moves.
+Likewise `reachtarget`, which gets a binary sensor named after a behaviour nobody has
+watched it perform, and `worktime`, which ships as `total_increasing` — a promise this
+library makes on the device's behalf that Home Assistant will read a decrease as a meter
+reset.
 
 Where a physical consequence is the only available instrument, a check reads it and says so.
 Where it cannot tell a wrong mapping from a unit that simply is not cooling, it names both
 and says which one is in scope.
+
+Where something better exists, it is used instead. Dry mode is read off the thermostat
+rather than the room: park the temperature setpoint where the unit calls itself satisfied,
+change nothing about it, and switch to dry with a humidity target below ambient. If
+`reachtarget` goes out, the device is comparing something other than the two temperatures,
+and `rhlevel` is the only other setpoint it has — so dry is the humidity mode and the
+humidity target is a number the device acts on. That replaced a three-minute wait for the
+ambient humidity to fall, which failed against a working unit: the reading flaps between
+two adjacent integers, so its own noise is the size of the change being looked for.
 
 Every check reports what it measured, pass or fail, because pinning down a number the
 table only guesses at is half the reason to run it — including how long the machine took,
@@ -212,26 +222,40 @@ which is how `worktime`'s units get established at all:
 
 ```
   PASS  protocol      extra_moves_the_setpoint_within_the_claimed_range  (12s)
+        setpoint_before_extra = 86
         setpoint_under_extra = 61
-        table_floor = 60
-  PASS  thermal       the_runtime_counter_advances  (63s)
-        work_time_before = 1200
-        work_time_after = 1201
-        seconds_to_tick = 61.4
-        step = 1
+        table_floor = 61
+  FAIL  capabilities  the_setpoint_range_is_accepted  (18s)
+        The setpoint range is accepted at both ends
+        -> the table offers 60 but the device clamped it to 61; 61 is the real limit
+        setpoint_86_became = 86
+        setpoint_60_became = 61
 ```
+
+That second one is from the first live run, and is what the table now says. It moved four
+numbers: the setpoint floor from 60 to 61, the humidity ceiling from 80 to 70, and the
+display light off the window unit's feature list entirely — it reports `lighton` and
+ignores every command to it, so the switch built from that field did nothing. Both READMEs
+lost a claim too: fan mode turns down sleep, but accepts Extra and eco, and a unit powered
+down does not necessarily park its fan.
 
 Two checks deliberately bypass validation, and only these two: the setpoint and humidity
 ranges are probed one step past each end with a raw frame. Every other check can find a
 range that is too *wide*, because the library offers a value and the device clamps it.
 None can find one that is too narrow, because the library refuses out-of-range values
 before they reach the wire — so a unit happily accepting 58 would never be asked, and its
-owner would simply never be offered a setting their hardware has.
+owner would simply never be offered a setting their hardware has. The first live run found
+the shipped range wrong in both directions at once, which is the argument for both halves.
+
+A check that walks a list — every claimed feature, both ends of a range — reports every
+item, not the first bad one. That run stopped at a display switch the device ignores and so
+never tested the beeper, and failed a humidity bound before reaching the probe behind it.
 
 What a passing run still does not cover is stated rather than implied: the Celsius mapping
 (`tempunit` is read-only), the fault-code vocabulary and the water and filter readings
-(cannot be induced), availability (needs the plug pulled), and which louvre `oscset1`
-moves (needs eyes on the unit).
+(cannot be induced), availability (needs the plug pulled), which louvre `oscset1` moves
+(needs eyes on the unit), and whether dry mode removes any water — the ambient humidity
+reading's own flap between two integers is larger than anything one run can measure.
 
 A failure means a claim in this library that your hardware does not support — a different
 firmware, or a model the table describes wrongly. `-o results.json` writes the run with

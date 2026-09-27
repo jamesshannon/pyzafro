@@ -119,6 +119,9 @@ class Check:
     cost: int
     #: Soak periods on top of that, for a check that waits on the machine working.
     soaks: int = 0
+    #: Waits that give up after REACH_WAIT instead, for a check waiting on the MCU to
+    #: compare two numbers it already has rather than on the room to change.
+    reaches: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,7 +146,7 @@ CHECKS: list[Check] = []
 
 
 def _check(
-    suite: str, claim: str, *, cost: int, soaks: int = 0
+    suite: str, claim: str, *, cost: int, soaks: int = 0, reaches: int = 0
 ) -> Callable[[_CheckFunc], _CheckFunc]:
     """Register a check, taking its name from the function's."""
 
@@ -156,6 +159,7 @@ def _check(
                 run=func,
                 cost=cost,
                 soaks=soaks,
+                reaches=reaches,
             )
         )
         return func
@@ -181,6 +185,9 @@ class Context:
         self.poll_seconds = poll
         #: Numbers a check pinned down, reported whatever its verdict.
         self.measured: dict[str, Any] = {}
+        #: Failures a check chose to finish walking past. Collected by the runner, so
+        #: that recording one cannot silently become the check passing.
+        self.deferred: list[str] = []
 
     @property
     def state(self) -> DeviceState:
@@ -258,6 +265,17 @@ class Context:
         finally:
             unsubscribe()
 
+    async def confirmed(self) -> DeviceState:
+        """Re-read full state, for a claim that optimism could answer by itself.
+
+        Most checks can read the merged state, because a settle outlasts the resync that
+        would correct it. Not one about a value the library sent and the device merely
+        declined to mention: there the merged view is this library quoting itself back.
+        A cmd:3 reply is the device's own answer.
+        """
+        await self.device.async_refresh()
+        return self.device.state
+
     def note(self, **values: Any) -> None:
         """Record what this check measured, for the report and for the table."""
         self.measured.update(values)
@@ -266,6 +284,22 @@ class Context:
         """Fail the check, saying what was expected and what the device did instead."""
         if not condition:
             raise CheckFailedError(detail)
+
+    def expect_but_continue(self, condition: bool, detail: str) -> None:  # noqa: FBT001
+        """Record a failure without abandoning the claims after it.
+
+        For a check that walks a list — every claimed feature, both ends of a range —
+        where stopping at the first bad one hides every later one behind it. A live run
+        found the table claiming a display switch the device ignores, and because that
+        aborted the loop the mute switch went untested; the same run never reached the
+        humidity range's narrowness probe because the clamp check ahead of it failed.
+        One run should name everything wrong with the table, not the first thing.
+
+        The runner raises whatever accumulates here, so a check cannot record a failure
+        and then pass by forgetting to look.
+        """
+        if not condition:
+            self.deferred.append(detail)
 
     def expect_speed(self, wanted: int) -> None:
         """Assert the fan settled at `wanted`, with nothing left to override it."""
@@ -602,18 +636,27 @@ async def extra_moves_the_setpoint_within_the_claimed_range(ctx: Context) -> Non
         await ctx.command(ctx.device.async_set_target_temperature(high))
 
 
-@_check("protocol", "A cooling programme is refused outright in fan mode", cost=4)
-async def a_cooling_programme_is_refused_in_fan_mode(ctx: Context) -> None:
+@_check("protocol", "Sleep is refused in fan mode", cost=4)
+async def sleep_is_refused_in_fan_mode(ctx: Context) -> None:
     """Check the documented non-bug, because users are told to expect it.
 
-    Sleep, EXTRA and eco are cooling programmes. In fan mode the device acknowledges the
-    command and then switches the setting straight back off, which looks exactly like a
-    dropped write. Both READMEs promise it is the unit and not the integration; this is
-    what keeps that promise honest.
+    In fan mode the device acknowledges a sleep command and then switches the setting
+    straight back off, which looks exactly like a dropped write. Both READMEs promise it
+    is the unit and not the integration; this is what keeps that promise honest.
 
     It doubles as the only live exercise of reconciliation that does not need a fault
     injected: the library applies the setting optimistically and has to end up back at
     the device's answer without anybody asking it to.
+
+    Both READMEs used to extend that promise to EXTRA and eco, on the reasoning that all
+    three are cooling programmes. A live run refused it: on firmware 1.0.29 fan mode
+    accepted and kept both. Not unreasonable of it — EXTRA is the top of the fan
+    control and eco forces the bottom of it, and both of those mean something with no
+    compressor involved — but it does mean the grouping was a guess about the device's
+    reasoning rather than an observation. So only sleep is asserted here. What the other
+    two do is recorded, because a reader of this output deserves the number, and left
+    without a verdict, because nothing in this library depends on the answer and a
+    firmware that changed its mind either way would not be a bug in it.
     """
     ctx.requires_mode(Mode.FAN)
     was_mode = ctx.state.mode
@@ -626,19 +669,19 @@ async def a_cooling_programme_is_refused_in_fan_mode(ctx: Context) -> None:
     )
     await ctx.command(ctx.device.async_set_mode(Mode.FAN))
     try:
-        refused = {}
+        kept = {}
         for feature, name, setter in programmes:
             if not ctx.caps.has(feature):
                 continue
             await ctx.command(setter())
-            refused[name] = getattr(ctx.state, name)
-        ctx.note(**{f"{name}_in_fan_mode": value for name, value in refused.items()})
-        still_on = [name for name, value in refused.items() if value is True]
-        ctx.expect(
-            not still_on,
-            f"fan mode accepted and kept {', '.join(still_on)}, which the READMEs say "
-            f"it refuses; a consumer could offer those controls in fan mode after all",
-        )
+            kept[name] = getattr(ctx.state, name)
+        ctx.note(**{f"{name}_in_fan_mode": value for name, value in kept.items()})
+        if "sleep" in kept:
+            ctx.expect(
+                kept["sleep"] is not True,
+                "fan mode accepted and kept sleep, which both READMEs say it refuses; "
+                "a consumer could offer that control in fan mode after all",
+            )
     finally:
         if was_mode is not Mode.FAN:
             await ctx.command(ctx.device.async_set_mode(was_mode))
@@ -649,25 +692,40 @@ async def the_unit_off_is_not_a_state_settings_survive(ctx: Context) -> None:
     """Check the two claims the off state rests on, one of which this tool relies on.
 
     First, that the fan parks at its slowest speed when the unit is powered down and
-    reports that — which is why the integration's README has to tell users that a unit
-    showing Low while off is not a stale reading.
+    reports that. Second, that a setting written to a unit that is off is not kept.
+    `_restore` is built on the second: it sends settings before power when the unit was
+    found off, because the other order would silently lose them. A tool whose promise to
+    put things back depends on an unverified assumption should verify it.
 
-    Second, that a setting written to a unit that is off is not kept. `_restore` is
-    built on it: it sends settings before power when the unit was found off, because
-    the other order would silently lose them. A tool whose promise to put things back
-    depends on an unverified assumption should verify it.
+    A live run refused both. Powered down at speed 4 the unit reported 4, and a fresh
+    `windlevel: 4` sent while off was acknowledged and never corrected. Both READMEs had
+    been telling users that a fan speed shown while off was the parked one, on the
+    strength of an earlier probe that happened to be run off. The ordering in `_restore`
+    is kept because it costs nothing and cannot be wrong, but it is a precaution now
+    rather than a requirement. Both halves are asserted and both reported, which is the
+    fix for a check that measured one of its claims and asserted only the other.
+
+    Read from a `cmd:3` reply for the same reason the feature walk is: these are values
+    the library sent and the device did not mention, so merged state would answer with
+    this library's own optimism.
     """
     ctx.requires(Feature.FAN_SPEED)
     was_power = ctx.state.power
     await ctx.command(ctx.device.async_set_fan_speed(ctx.top_speed()))
     await ctx.command(ctx.device.async_set_power(on=False))
-    parked = ctx.state.fan_speed
+    parked = (await ctx.confirmed()).fan_speed
     ctx.note(fan_speed_while_off=parked)
     try:
         await ctx.command(ctx.device.async_set_fan_speed(ctx.top_speed()))
-        kept = ctx.state.fan_speed
+        kept = (await ctx.confirmed()).fan_speed
         ctx.note(fan_speed_commanded_while_off=kept)
-        ctx.expect(
+        ctx.expect_but_continue(
+            parked != ctx.top_speed(),
+            f"the unit was powered down at speed {ctx.top_speed()} and still reports "
+            f"{parked}; it does not park the fan, so the integration's README is wrong "
+            f"to tell users that Low while off is the real setting",
+        )
+        ctx.expect_but_continue(
             kept != ctx.top_speed(),
             f"the unit is off and it kept fan speed {kept}; settings written while off "
             f"do stick after all, so _restore is ordering its frames for no reason",
@@ -797,6 +855,13 @@ async def every_claimed_feature_is_accepted(ctx: Context) -> None:
 
     Only the plain booleans are exercised here. The fan suite covers the positions of
     the fan control, which interact and need their own transitions.
+
+    Read back from a full re-read rather than from merged state. A device that ignores
+    the key answers nothing at all, so the merged view holds the library's own
+    optimistic write until the resync corrects it — which means reading merged state
+    tests this check's settle against RESYNC_DELAY rather than the device. A live run
+    caught an ignored `lighton` only because the default settle happens to be the longer
+    of the two; at `--settle 3` it would have passed a dud switch.
     """
     switches: tuple[tuple[Feature, str, Callable[[bool], Awaitable[None]]], ...] = (
         (
@@ -822,8 +887,9 @@ async def every_claimed_feature_is_accepted(ctx: Context) -> None:
             continue
         was = getattr(ctx.state, name)
         await ctx.command(setter(not was))
-        got = getattr(ctx.state, name)
-        ctx.expect(
+        got = getattr(await ctx.confirmed(), name)
+        ctx.note(**{f"{name}_accepted": got is not was})
+        ctx.expect_but_continue(
             got is not was,
             f"the table claims {feature}, but setting {name} to {not was} left it at "
             f"{got}; the control it builds does nothing",
@@ -849,7 +915,7 @@ async def the_setpoint_range_is_accepted(ctx: Context) -> None:
             await ctx.command(ctx.device.async_set_target_temperature(wanted))
             got = ctx.state.target_temperature
             ctx.note(**{f"setpoint_{wanted}_became": got})
-            ctx.expect(
+            ctx.expect_but_continue(
                 got == wanted,
                 f"the table offers {wanted} but the device clamped it to {got}; "
                 f"{got} is the real limit",
@@ -943,7 +1009,7 @@ async def the_humidity_range_is_accepted(ctx: Context) -> None:
             await ctx.command(ctx.device.async_set_target_humidity(wanted))
             got = ctx.state.target_humidity
             ctx.note(**{f"humidity_{wanted}_became": got})
-            ctx.expect(
+            ctx.expect_but_continue(
                 got == wanted,
                 f"the table offers {wanted} but the device clamped it to {got}; "
                 f"{got} is the real limit",
@@ -1040,6 +1106,14 @@ async def some_assumptions_cannot_be_checked_at_all(ctx: Context) -> None:
     Availability is the other gap. It comes from the MQTT last-will topic, so testing it
     means pulling the plug out; and which louvre `oscset1` moves can only be settled by
     watching the unit. Both are jobs for a human standing next to it.
+
+    Whether the unit removes water in dry mode, and whether `rh` is the room's humidity
+    rather than some reading inside the machine, went on this list after a live run. A
+    check asked it of a real dehumidifying unit for three minutes and failed it: the
+    reading flaps continuously between two adjacent integers, so its own noise is the
+    size of the change being looked for, and a room reloads humidity as fast as a window
+    unit takes it out. What this library actually claims about that mode is tested
+    without the room, in `dry_mode_regulates_humidity_not_temperature`.
     """
     unit = ctx.state.temperature_unit
     ctx.note(temperature_unit=unit and unit.name.lower())
@@ -1047,7 +1121,9 @@ async def some_assumptions_cannot_be_checked_at_all(ctx: Context) -> None:
         "not covered: the Celsius mapping (tempunit is read-only, this unit reports "
         f"{unit.name.lower() if unit else unit}); the fault-code vocabulary and the "
         "water/filter readings (cannot be induced); availability (needs the plug "
-        "pulled); which axis oscset1 moves (needs eyes on the louvres)"
+        "pulled); which axis oscset1 moves (needs eyes on the louvres); whether dry "
+        "mode removes water, and whether rh is the room (the reading's own flap "
+        "between two integers is larger than anything measurable in one run)"
     )
 
 
@@ -1159,7 +1235,7 @@ async def an_overridden_command_ends_up_at_the_devices_answer(ctx: Context) -> N
         ctx.expect(
             settled is not True,
             "fan mode kept sleep on, so there is no override here to reconcile; check "
-            "a_cooling_programme_is_refused_in_fan_mode for what changed",
+            "sleep_is_refused_in_fan_mode for what changed",
         )
     finally:
         if was_mode is not Mode.FAN:
@@ -1223,7 +1299,7 @@ async def base_info_reports_a_signal_strength(ctx: Context) -> None:
     "thermal",
     "The thermostat reports whether it has reached the target",
     cost=4,
-    soaks=1,
+    reaches=1,
 )
 async def reached_target_follows_the_setpoint(ctx: Context) -> None:
     """Check whether the binary sensor this library ships is a sensor at all.
@@ -1298,6 +1374,12 @@ async def cool_mode_is_the_mode_that_cools(ctx: Context) -> None:
 
     The same argument covers `temperature` being the ambient reading rather than a coil
     or a board, since a value that does not move while the unit cools is not the room.
+
+    The baseline has to be still before the command goes out. A live run passed this in
+    0.0 seconds — the reading had already fallen two degrees before the wait began, left
+    over from the check before it, and a fall the command cannot be credited with proves
+    nothing about what the command means. So the reading is watched for a poll first,
+    and a room already on its way down is a skip rather than a pass.
     """
     low, high = ctx.temperature_bounds()
     if ctx.state.mode is not Mode.COOL:
@@ -1309,6 +1391,16 @@ async def cool_mode_is_the_mode_that_cools(ctx: Context) -> None:
         raise CheckSkippedError(
             f"ambient is already {before}, at or below the lowest setpoint {low}, so "
             f"cooling cannot be told apart from doing nothing"
+        )
+    settling = await ctx.until(
+        lambda: (now := ctx.state.ambient_temperature) is not None and now != before,
+        timeout=ctx.poll_seconds,
+    )
+    if settling is not None:
+        ctx.note(ambient_was_already_moving_from=before)
+        raise CheckSkippedError(
+            f"ambient moved from {before} to {ctx.state.ambient_temperature} before "
+            f"this check commanded anything, so a fall cannot be attributed to it"
         )
     try:
         await ctx.command(ctx.device.async_set_fan_speed(ctx.top_speed()))
@@ -1334,47 +1426,101 @@ async def cool_mode_is_the_mode_that_cools(ctx: Context) -> None:
         await ctx.command(ctx.device.async_set_target_temperature(high))
 
 
-@_check("thermal", "Mode.DRY is the mode that dehumidifies", cost=4, soaks=1)
-async def dry_mode_is_the_mode_that_dehumidifies(ctx: Context) -> None:
-    """Check `Mode.DRY = 2` the same way, and whether `rhlevel` drives anything at all.
+@_check(
+    "thermal",
+    "Mode.DRY regulates humidity, not temperature",
+    cost=5,
+    reaches=1,
+)
+async def dry_mode_regulates_humidity_not_temperature(ctx: Context) -> None:
+    """Check `Mode.DRY = 2` and whether `rhlevel` drives anything at all.
 
-    Two claims with one wait. The mode number has the same provenance as cool's and the
-    same consequence if wrong. And `target_humidity` is offered as a control on the
-    assumption that the device acts on it — `rhlevel` has been seen at two values, `rh`
-    has only ever been watched drifting on its own, and nothing has ever connected them.
-    If the device merely stores the number, the control should not exist.
+    Two claims at once. The mode number has the same provenance as cool's and the same
+    consequence if wrong. And `target_humidity` is a control built on the assumption
+    that the device acts on it: `rhlevel` had been seen at two values, `rh` only ever
+    drifting on its own, and nothing had ever connected them. If the device merely
+    stores the number, the control should not exist.
+
+    The instrument is the MCU's own comparator, not the room. Park the temperature
+    setpoint where cool mode calls the thermostat satisfied and confirm it says so.
+    Then change nothing about the temperature and switch to dry with a humidity target
+    well below ambient. If `reachtarget` goes unsatisfied the device is comparing
+    something other than the two temperatures, and `rhlevel` is its only other
+    setpoint — so it reads the number this library sends, and dry is where it matters.
+
+    This began as a three-minute wait for `rh` to fall, the wrong instrument, and a
+    live run showed why: the reading flaps between two adjacent integers continuously,
+    so the noise band is as large as the change being looked for, and a room reloads
+    humidity while a unit removes it. It failed against a working unit. What survives of
+    that question is in `some_assumptions_cannot_be_checked_at_all`; what is in scope is
+    which setpoint the mode regulates, and that is answerable in a few seconds and
+    answerable the same way every time.
     """
-    low, _high = ctx.humidity_bounds()
+    if BinarySensorKey.REACHED_TARGET not in ctx.caps.binary_sensors:
+        raise CheckSkippedError("model does not report reached_target")
     ctx.requires_mode(Mode.DRY)
+    low, high = ctx.humidity_bounds()
+    _tlow, thigh = ctx.temperature_bounds()
     was_mode = ctx.state.mode
-    before = ctx.state.ambient_humidity
-    if before is None:
+    if ctx.state.mode is not Mode.COOL:
+        raise CheckSkippedError("this needs to start in cool mode, with a known target")
+    ambient = ctx.state.ambient_humidity
+    if ambient is None:
         raise CheckSkippedError("the device reports no ambient humidity")
-    if before <= low:
+    if ambient <= low:
         raise CheckSkippedError(
-            f"ambient humidity is already {before}, at or below the lowest target "
-            f"{low}, so dehumidifying cannot be told apart from doing nothing"
+            f"ambient humidity is {ambient}, at or below the lowest target {low}, so "
+            f"the humidity target cannot be put out of reach"
         )
-    await ctx.command(ctx.device.async_set_mode(Mode.DRY))
+
+    await ctx.command(ctx.device.async_set_target_temperature(thigh))
+    satisfied = ctx.state.reached_target
+    ctx.note(reached_target_with_temperature_satisfied=satisfied)
+    if satisfied is not True:
+        raise CheckSkippedError(
+            f"the setpoint is at {thigh} and reached_target reads {satisfied}, so "
+            f"there is no satisfied baseline to change the mode away from"
+        )
     try:
+        await ctx.command(ctx.device.async_set_mode(Mode.DRY))
         await ctx.command(ctx.device.async_set_target_humidity(low))
         waited = await ctx.until(
-            lambda: (now := ctx.state.ambient_humidity) is not None and now < before
+            lambda: ctx.state.reached_target is not True,
+            timeout=min(REACH_WAIT, ctx.soak_seconds),
         )
-        after = ctx.state.ambient_humidity
+        after = ctx.state.reached_target
         ctx.note(
-            humidity_before=before,
-            humidity_after=after,
-            seconds_to_fall=waited and round(waited, 1),
+            humidity_target=low,
+            ambient_humidity=ctx.state.ambient_humidity,
+            reached_target_in_dry=after,
+            seconds_to_change=waited and round(waited, 1),
         )
         ctx.expect(
             waited is not None,
-            f"mode {int(Mode.DRY)} is decoded as dry and rhlevel as its setpoint, but "
-            f"ambient humidity read {before} and still reads {after} after "
-            f"{ctx.soak_seconds:.0f}s at a target of {low}. Either one of those "
-            f"mappings is wrong, or the target is a number the device only stores — in "
-            f"which case the humidity control should not be offered",
+            f"the temperature setpoint is still at {thigh} and satisfied, but asking "
+            f"mode {int(Mode.DRY)} for {low}% against an ambient {ambient}% left "
+            f"reached_target at {after}. The thermostat is not watching the humidity "
+            f"target, so either mode {int(Mode.DRY)} is not dry or rhlevel is a number "
+            f"the device only stores — and if it only stores it, the humidity control "
+            f"should not be offered at all",
         )
+        if high >= ambient:
+            await ctx.command(ctx.device.async_set_target_humidity(high))
+            back = await ctx.until(
+                lambda: ctx.state.reached_target is True,
+                timeout=min(REACH_WAIT, ctx.soak_seconds),
+            )
+            ctx.note(reached_target_with_humidity_satisfied=ctx.state.reached_target)
+            ctx.expect(
+                back is not None,
+                f"reached_target went unsatisfied for a humidity target of {low} but "
+                f"would not come back for {high} against an ambient {ambient}; it is "
+                f"not tracking the humidity target either way",
+            )
+        else:
+            # The converse needs a target the device will accept at or above ambient,
+            # and the ceiling is below the room today. Nothing to do but say so.
+            ctx.note(reached_target_with_humidity_satisfied="not reachable")
     finally:
         if was_mode is not None and was_mode is not Mode.DRY:
             await ctx.command(ctx.device.async_set_mode(was_mode))
@@ -1395,6 +1541,14 @@ async def the_runtime_counter_advances(ctx: Context) -> None:
     the wait ends on the first tick, so the elapsed time and the size of the step are
     both recorded. A counter in minutes announces itself by moving by 1 after about a
     minute. Needs the unit running but not the compressor.
+
+    No tick is a result too, and the interesting half of one. A live run sat through the
+    whole deadline without the counter moving, which rules out seconds and rules out
+    minutes — so the hours this library ships it in survive, having been a guess drawn
+    from `filterthr` reading 600 beside it, which is a filter reminder in hours if it
+    is anything. Not a confirmation, and not recorded as one, but a counter too
+    coarse to catch is the outcome hours predicts and the outcome the other two units
+    rule out, so it is reported as evidence rather than as nothing.
     """
     if SensorKey.WORK_TIME not in ctx.caps.sensors:
         raise CheckSkippedError("model does not report a runtime counter")
@@ -1416,11 +1570,14 @@ async def the_runtime_counter_advances(ctx: Context) -> None:
         f"reset, so the state class is wrong",
     )
     if waited is None:
+        ctx.note(units_finer_than_the_deadline=False)
         raise CheckSkippedError(
             f"the counter did not move in {ctx.soak_seconds:.0f}s of running (still "
-            f"{before}), so its units are coarser than that — the state class is not "
-            f"contradicted, but this run cannot confirm it either"
+            f"{before}), which rules out seconds and minutes and leaves the hours this "
+            f"library ships it in — consistent, unconfirmed, and as far as a run of "
+            f"this length can get"
         )
+    ctx.note(units_finer_than_the_deadline=True)
 
 
 # --- the runner ---------------------------------------------------------------------
@@ -1494,7 +1651,13 @@ class SelfTest:
         # anything but is budgeted as though it does.
         settles = sum(check.cost + 1 for check in checks) + _PREPARE_SETTLES
         soaks = sum(check.soaks for check in checks)
-        return settles * self.settle + soaks * self.soak + len(checks) * 0.5
+        reaches = sum(check.reaches for check in checks)
+        return (
+            settles * self.settle
+            + soaks * self.soak
+            + reaches * min(REACH_WAIT, self.soak)
+            + len(checks) * 0.5
+        )
 
     def plan(self) -> list[str]:
         """Describe what the run will do, for a human to approve before it does it."""
@@ -1587,17 +1750,29 @@ class SelfTest:
 
         unsubscribe = self.device.subscribe_raw(record)
         self._context.measured = {}
+        self._context.deferred = []
         try:
             await check.run(self._context)
-            outcome, detail = "pass", ""
         except CheckSkippedError as err:
             outcome, detail = "skip", str(err)
         except CheckFailedError as err:
             outcome, detail = "fail", str(err)
         except Exception as err:  # noqa: BLE001 - one bad check must not end the run
             outcome, detail = "error", f"{type(err).__name__}: {err}"
+        else:
+            outcome, detail = "pass", ""
         finally:
             unsubscribe()
+        # Deferred failures outrank a pass and a skip alike, and a hard failure after
+        # them does not bury them: a check that walks past one chose to keep testing,
+        # not to forgive it. Collecting them here is what makes that impossible to
+        # forget, and what stops one fault at the top of a walk hiding the rest.
+        if self._context.deferred:
+            found = [*self._context.deferred]
+            if outcome == "fail" and detail:
+                found.append(detail)
+            outcome = "fail"
+            detail = "; ".join(found)
         return CheckResult(
             name=check.name,
             suite=check.suite,

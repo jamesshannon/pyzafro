@@ -142,11 +142,11 @@ class Capabilities:
         return feature in self.features
 
     def refined(self, observed: Collection[str]) -> Capabilities:
-        """Narrow these capabilities to the DeviceState fields actually reported.
+        """Rebuild these capabilities around the DeviceState fields actually reported.
 
-        Only ever called for a model the table does not describe, and only ever
-        subtracts — the fallback is a guess, and a guess contradicted by evidence
-        should lose. Two things fall out of that:
+        Only ever called for a model the table does not describe, where the fallback is
+        a guess and a guess contradicted by evidence should lose. Two things fall out of
+        that:
 
         A product from a class we have never handled reports none of the climate
         fields, so it ends up claiming nothing, and the consumer builds no climate
@@ -155,6 +155,15 @@ class Capabilities:
         An air conditioner we simply have not catalogued keeps everything it
         demonstrated, which is usually *more* than the fallback claims: the fallback
         offers no sleep or swing, but a unit reporting those fields gets them.
+
+        So the ranges and the mode list only ever narrow, while the features, switches
+        and sensors are rebuilt from what was seen and can come out either way. That
+        second half rests on an inference this library now knows to be unsound in one
+        direction: a live run found `90038EAC0-12K-ZAZ` reporting `lighton` and ignoring
+        every command to it, so a reported field is not proof of a working control. It
+        is kept because for an unknown model it is the only evidence there is, and a
+        catalogued model never comes through here — but it is why a model that has been
+        characterised gets a hand-written entry rather than this.
         """
         seen = set(observed)
         return Capabilities(
@@ -235,14 +244,21 @@ _WINDOW_AC_SENSORS: Final = frozenset(
 #: because it is not one of those positions — it is what the device reports while sleep
 #: runs, and neither the remote nor the app can select it.
 #:
-#: The two ranges are NOT confirmed. Observed setpoints span 61-76F and the only
-#: humidity targets ever seen are 30 and 50. They are set to the conventional range for
-#: a US window unit and should be tightened when someone hits a limit.
+#: Both ranges were tightened from live selftest runs against this model, having
+#: shipped as the conventional range for a US window unit. The device clamps rather
+#: than rejects, so the limits are what it clamped to: 60 came back 61 and 59 came back
+#: 61, 87 came back 86; a humidity target of 80 came back 70. The humidity floor of 30
+#: is accepted but has not been probed from below.
+#:
+#: `lighton` is reported by this model and ignored as a command — a commanded
+#: {"lighton": false} drew no acknowledgement at all and a full re-read still said
+#: true — so DISPLAY is absent despite the field being there. It was only ever inferred
+#: from the app's key list; nothing ever watched it work.
 _WINDOW_AC = Capabilities(
     modes=frozenset({Mode.COOL, Mode.DRY, Mode.FAN}),
     fan_speeds=(1, 2, 3, 4),
-    target_temperature_range=(60, 86),
-    target_humidity_range=(30, 80),
+    target_temperature_range=(61, 86),
+    target_humidity_range=(30, 70),
     features=frozenset(
         {
             Feature.SLEEP,
@@ -252,7 +268,6 @@ _WINDOW_AC = Capabilities(
             Feature.SWING_VERTICAL,
             Feature.FAN_SPEED,
             Feature.CHILD_LOCK,
-            Feature.DISPLAY,
             Feature.MUTE,
         }
     ),
@@ -262,7 +277,6 @@ _WINDOW_AC = Capabilities(
             SwitchKey.SLEEP,
             SwitchKey.ECO,
             SwitchKey.CHILD_LOCK,
-            SwitchKey.DISPLAY,
             SwitchKey.MUTE,
         }
     ),

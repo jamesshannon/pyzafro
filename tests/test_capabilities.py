@@ -77,25 +77,34 @@ def test_a_product_from_another_class_claims_nothing():
     assert caps.switches == frozenset()
 
 
-def test_refinement_only_ever_subtracts():
+def test_refinement_narrows_the_ranges_and_never_widens_them():
+    """The numbers only ever lose. A field not seen takes its range away with it."""
     known = resolve("90038EAC0-12K-ZAZ")
     assert known.known_model
-    # Every field the window unit reports, so nothing should be lost.
-    everything = {
-        "mode",
-        "target_temperature",
-        "target_humidity",
-        "fan_speed",
-        "sleep",
-        "eco",
-        "child_lock",
-        "display",
-        "mute",
-        "swing_horizontal",
-        "swing_vertical",
-        "extra",
-    }
-    assert known.refined(everything).features == known.features
+
+    refined = known.refined({"mode", "fan_speed", "target_temperature"})
+
+    assert refined.modes == known.modes
+    assert refined.fan_speeds == known.fan_speeds
+    assert refined.target_temperature_range == known.target_temperature_range
+    assert refined.target_humidity_range is None
+
+
+def test_refinement_rebuilds_the_features_and_can_add_one_the_table_withheld():
+    """A reported field is not proof of a working control, and refinement cannot tell.
+
+    `90038EAC0-12K-ZAZ` reports `lighton` and ignores every command to it, which is why
+    DISPLAY is absent from its entry. Refinement works from reported fields alone, so it
+    would hand that switch straight back — the documented reason a characterised
+    model gets a hand-written entry instead of going through here.
+    """
+    known = resolve("90038EAC0-12K-ZAZ")
+    assert Feature.DISPLAY not in known.features
+
+    refined = known.refined({"mode", "display"})
+
+    assert Feature.DISPLAY in refined.features
+    assert not refined.known_model
 
 
 def test_an_unknown_air_conditioner_gains_extra_by_reporting_it():
