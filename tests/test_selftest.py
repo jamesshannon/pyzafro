@@ -1035,11 +1035,11 @@ async def test_the_cool_check_reads_the_thermostat_and_not_the_room():
     that version disagreed on the same unit in the same room: a pass in 0.0 seconds off
     a reading on its way down, then a failure after the full soak. What the mapping
     claims is which way round the thermostat is satisfied, which the MCU answers at
-    once — so the check carries a `reaches` deadline rather than a `soaks` one, and
-    never reads `ambient_temperature` for a verdict.
+    once — so the check is budgeted a `reaches` deadline and never reads
+    `ambient_temperature` for a verdict. There is no soak left to carry instead.
     """
     cooling = next(c for c in CHECKS if c.suite == "thermal" and "cool_mode" in c.name)
-    assert cooling.soaks == 0
+    assert not hasattr(cooling, "soaks")
     assert cooling.reaches == 1
 
     _, results = await _run(FakeUnit())
@@ -1086,9 +1086,21 @@ async def test_the_dry_check_no_longer_waits_on_the_room():
     """
     dry = next(c for c in CHECKS if c.suite == "thermal" and "dry_mode" in c.name)
 
-    assert dry.soaks == 0
     assert dry.reaches == 1
     assert REACH_WAIT < 180.0
+
+
+async def test_no_check_can_budget_a_wait_on_the_room():
+    """Three did, and all three were wrong, so the budget line is gone.
+
+    Both mode checks because each ambient reading alternates between two adjacent
+    integers, which makes the noise twice the smallest change either could look for; the
+    runtime counter because it ticks in hours, which no tolerable wait can see. None of
+    them is fixable by waiting longer. Keeping a `soaks` field would invite a fourth, so
+    a check that wants to wait on physics now has to reintroduce the idea on purpose.
+    """
+    assert not hasattr(Check, "soaks")
+    assert all(check.reaches <= 1 for check in CHECKS)
 
 
 async def test_a_reached_target_that_never_moves_is_a_constant_with_a_name():
@@ -1112,28 +1124,51 @@ async def test_reached_target_is_measured_on_both_sides_of_the_setpoint(unit):
 async def test_a_runtime_counter_too_coarse_to_move_is_a_skip_not_a_pass():
     """Its units have never been established, so a flat reading proves nothing."""
     _, results = await _run(FakeUnit(runtime_step=0))
-    runtime = _one(results, "the_runtime_counter_advances")
+    runtime = _one(results, "the_runtime_counter_is_monotonic")
     assert runtime.outcome == "skip"
     # And it says what the flat reading did settle, because a counter too coarse to
     # catch is what hours predicts and is not what seconds or minutes would look like.
     assert "rules out seconds and minutes" in runtime.detail
-    assert runtime.measured["units_finer_than_the_deadline"] is False
+    assert runtime.measured["units_finer_than_the_run"] is False
 
 
 async def test_the_runtime_check_is_about_the_state_class_not_the_appliance():
     """`total_increasing` is a promise this library makes, so a decrease is its bug."""
     _, results = await _run(FakeUnit(runtime_step=-5))
-    runtime = _one(results, "the_runtime_counter_advances")
+    runtime = _one(results, "the_runtime_counter_is_monotonic")
     assert runtime.outcome == "fail"
     assert "the state class is wrong" in runtime.detail
+
+
+async def test_the_runtime_window_is_the_whole_run_and_costs_nothing():
+    """It used to soak for three minutes of its own and learn nothing, twice.
+
+    The counter did not move in either live run, so six minutes bought two skips. The
+    state the run found is a window four times longer for no wait at all, which is also
+    long enough to tell "minutes, and the tick was just missed" from "hours".
+    """
+    runtime = next(c for c in CHECKS if "runtime_counter" in c.name)
+    assert runtime.cost == 0
+    assert runtime.reaches == 0
+
+    transport = FakeUnit()
+    _, results = await _run(transport)
+    result = _one(results, "the_runtime_counter_is_monotonic")
+
+    # Measured against the counter as the run found it rather than as this check first
+    # saw it. The fake advances on every full read, and the checks ahead of this one do
+    # plenty, so a step of more than one is only possible from the wider window.
+    began = result.measured["work_time_when_the_run_began"]
+    assert result.measured["step"] == result.measured["work_time_now"] - began
+    assert result.measured["step"] > 2
 
 
 async def test_a_wait_ends_as_soon_as_the_machine_has_responded(unit):
     """A fixed sleep is slower and worse evidence than a deadline.
 
-    How long the change took is the measurement — it is what pins down the units of the
-    runtime counter and how fast the room responds — and a wait that always runs to its
-    deadline throws that away while making the run four soaks longer than it needs.
+    How long the device took is the measurement — it is what tells a thermostat that
+    answered at once from one that never answered — and a wait that always runs to its
+    deadline throws that away while making the run minutes longer than it needs.
     """
     device = _device(unit)
     await device.async_refresh()
@@ -1179,21 +1214,24 @@ async def test_a_wait_gives_the_device_at_least_one_look(unit):
     device.close()
 
 
-async def test_the_time_a_change_took_travels_with_the_result(unit):
+async def test_the_size_of_the_step_travels_with_the_result(unit):
     """The number that establishes what worktime's units actually are."""
     _, results = await _run(unit)
-    runtime = _one(results, "the_runtime_counter_advances")
+    runtime = _one(results, "the_runtime_counter_is_monotonic")
     assert runtime.outcome == "pass"
-    assert runtime.measured["step"] == 1
-    assert runtime.measured["seconds_to_tick"] is not None
+    assert runtime.measured["step"] >= 1
+    assert runtime.measured["seconds_of_running_observed"] is not None
 
 
 async def test_the_measured_numbers_travel_with_a_passing_result(unit):
     """Pinning down a number the table guesses at is the main reason to run this."""
     _, results = await _run(unit)
-    runtime = _one(results, "the_runtime_counter_advances")
+    runtime = _one(results, "the_runtime_counter_is_monotonic")
     assert runtime.outcome == "pass"
-    assert runtime.measured["work_time_after"] > runtime.measured["work_time_before"]
+    assert (
+        runtime.measured["work_time_now"]
+        > runtime.measured["work_time_when_the_run_began"]
+    )
 
     rssi = _one(results, "base_info_reports_a_signal_strength")
     assert rssi.measured["rssi"] == 44

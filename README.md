@@ -163,8 +163,8 @@ where the bugs have actually been.
 
 This is the full integration suite, not a smoke test. It is meant to be run rarely and
 deliberately — once before a release, or after a bug that got past the unit tests — and it
-is thorough in preference to quick or gentle. Sixteen minutes at worst, usually eleven or
-twelve, and it runs the machine.
+is thorough in preference to quick or gentle. Seventeen minutes at worst, nine or ten in
+practice, and it runs the machine.
 
 | suite | checks | what it exercises |
 |---|---|---|
@@ -175,12 +175,13 @@ twelve, and it runs the machine.
 | `thermal` | 4 | the mode mappings, which only a running unit's thermostat can answer |
 
 Selectable and repeatable with `--suite`, all of them by default. The first four take
-about eight minutes between them and never leave the thermostat unsatisfied for more than
-a settle. `thermal` is all of the electricity and about half the clock. One of its waits
-is on the runtime counter and gives up after `--soak` (three minutes); the other three are
-waiting on the MCU to compare two numbers it already holds, and give up after a minute.
-Every wait ends the moment the unit has answered, so the printed estimate is a ceiling and
-a healthy unit finishes well inside it — the last full run took under twelve.
+about eight minutes between them in practice and never leave the thermostat unsatisfied
+for more than a settle. `thermal` is all of the electricity and a third of the clock:
+three of its four checks wait on the MCU to compare two numbers it already holds, and give
+up after a minute; the fourth waits for nothing at all. Every wait ends the moment the unit
+has answered, so the printed estimate is a ceiling and a healthy unit finishes well inside
+it. The last full run took under fifteen minutes and two three-minute waits have come out
+of it since.
 
 **It runs the machine.** It prints what it will change, asks before starting, and restores
 every field afterwards — including after a failure or a Ctrl-C — then re-reads the device
@@ -203,8 +204,15 @@ behaviour nobody has watched it perform, and `worktime`, which ships as `total_i
 — a promise this library makes on the device's behalf that Home Assistant will read a
 decrease as a meter reset.
 
-**The room is not the instrument.** Both mode checks read the thermostat instead, because
-what a mode number actually claims is which setpoint that mode's thermostat compares
+**Nothing here waits on the room, and nothing should.** Three checks did and all three
+were wrong. The two mode checks because each ambient reading alternates between two
+adjacent integers, so the instrument's noise is twice the smallest change either could
+look for; the runtime counter because it ticks in hours, which no wait anyone would sit
+through can see. None of those is a tuning problem, so there is no soak left in the
+budget at all — a check that wants to wait on physics has to reintroduce the idea
+deliberately.
+
+What a mode number actually claims is which setpoint that mode's thermostat compares
 against and in which direction, and the MCU answers that in about a second from two
 numbers it already holds.
 
@@ -232,6 +240,15 @@ reading that alternates reads the same at both ends of a poll.
 
 So whether the machine removes any heat or any water is not something this suite answers.
 It is on the uncovered list below, with the reason.
+
+The runtime counter is the third case and fails differently: the instrument is exact and
+the timescale is wrong. `worktime` moves in hours, so a three-minute wait could never see
+it — both live runs sat through the whole deadline and skipped, which is six minutes spent
+establishing nothing. It compares against the state the run found instead: a window four
+times longer for no wait at all, and long enough to tell "minutes, and the tick was just
+missed" from "hours". What would actually settle the units is two runs a few days apart,
+which is one of the things `-o` is for — `worktime` read 2 on 2026-09-13 and 17 on
+2026-09-27, and no single run can see that however long it waits.
 
 Every check reports what it measured, pass or fail, because pinning down a number the
 table only guesses at is half the reason to run it — including how long the machine took,

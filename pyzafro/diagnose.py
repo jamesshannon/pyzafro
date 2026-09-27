@@ -681,10 +681,10 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=SOAK,
         help=(
-            "how long to wait AT MOST for the machine to do something measurable, for "
-            "the thermal suite. Every wait ends as soon as the unit responds, so this "
-            "is a deadline rather than a duration; ambient temperature is reported in "
-            "whole degrees, so too short a deadline fails a working unit"
+            "the ceiling on any single wait. Every wait ends as soon as the unit has "
+            "answered, so this is a deadline rather than a duration, and no check "
+            "waits on the room. Lower it and a slow unit starts being reported as "
+            "one that never answered"
         ),
     )
     selftest.add_argument(

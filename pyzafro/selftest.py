@@ -65,17 +65,16 @@ _LOGGER = logging.getLogger(__name__)
 #: being tight costs a false pass.
 SETTLE = 6.0
 
-#: How long to wait, *at most*, for the machine to do something measurable. A settle is
-#: long enough for the MCU to answer; nothing thermal happens on that scale. Ambient
-#: temperature is reported in whole degrees, so a change has to clear a whole degree
-#: before it is visible at all, and three minutes at the bottom of the setpoint range is
-#: the longest that should ever be needed.
+#: The ceiling on any single wait, and what `--soak` now sets. It began as "how long to
+#: let the machine run", which is not a thing any check does any more: nothing waits on
+#: the room, so nothing needs three minutes. It survives as the cap every other deadline
+#: is clamped to, which is also what collapses every wait to nothing in the unit tests.
+#: The name is older than the meaning and is worth changing.
 #:
-#: A deadline, not a duration. Every wait ends the moment the thing it is waiting for
-#: has happened, so a healthy unit spends a fraction of this and only a unit that is not
-#: responding spends all of it. The first version slept the full three minutes
-#: regardless, which is both slower and worse evidence: how long the change took is the
-#: measurement, and a fixed sleep throws it away.
+#: A deadline, not a duration, wherever it is used. Every wait ends the moment the thing
+#: it is waiting for has happened, so a healthy unit spends a fraction of any of these
+#: and only a unit that is not answering spends all of one. How long the device took is
+#: itself the measurement, and a fixed sleep throws it away.
 SOAK = 180.0
 
 #: How often to look while waiting. The device pushes ambient readings on its own, but
@@ -129,10 +128,16 @@ class Check:
     run: Callable[[Context], Awaitable[None]]
     #: Settle periods this check spends, for estimating a run before starting it.
     cost: int
-    #: Soak periods on top of that, for a check that waits on the machine working.
-    soaks: int = 0
-    #: Waits that give up after REACH_WAIT instead, for a check waiting on the MCU to
-    #: compare two numbers it already has rather than on the room to change.
+    #: Waits on the device reaching a state, budgeted at REACH_WAIT each.
+    #:
+    #: There is deliberately no soak here, and no check may wait on the room. Three did
+    #: once and all three were wrong: the two mode checks because each ambient reading
+    #: alternates between two adjacent integers, so the instrument's noise is twice the
+    #: smallest change they could look for; and the runtime counter because it ticks in
+    #: hours, which no tolerable wait can see. Waiting longer fixes neither. What a
+    #: mapping claims is which numbers the MCU compares and which way round, and the MCU
+    #: answers that at once; what the appliance physically does is out of scope and is
+    #: reported as uncovered. A budget line for physics would invite a fourth.
     reaches: int = 0
 
 
@@ -158,7 +163,7 @@ CHECKS: list[Check] = []
 
 
 def _check(
-    suite: str, claim: str, *, cost: int, soaks: int = 0, reaches: int = 0
+    suite: str, claim: str, *, cost: int, reaches: int = 0
 ) -> Callable[[_CheckFunc], _CheckFunc]:
     """Register a check, taking its name from the function's."""
 
@@ -170,7 +175,6 @@ def _check(
                 claim=claim,
                 run=func,
                 cost=cost,
-                soaks=soaks,
                 reaches=reaches,
             )
         )
@@ -200,6 +204,15 @@ class Context:
         #: Failures a check chose to finish walking past. Collected by the runner, so
         #: that recording one cannot silently become the check passing.
         self.deferred: list[str] = []
+        #: The state the run found, and when it began. Both set by the runner. A
+        #: counter too coarse for any single check to see moves over a whole run, and
+        #: that window costs nothing because the run was happening anyway.
+        self.baseline: DeviceState | None = None
+        self.began: float | None = None
+
+    def since_the_run_began(self) -> float:
+        """Return how long this run has been going, or 0 if nobody said when."""
+        return 0.0 if self.began is None else time.monotonic() - self.began
 
     @property
     def state(self) -> DeviceState:
@@ -1616,42 +1629,45 @@ async def dry_mode_regulates_humidity_not_temperature(ctx: Context) -> None:
             await ctx.command(ctx.device.async_set_mode(was_mode))
 
 
-@_check("thermal", "The runtime counter advances while the unit runs", cost=1, soaks=1)
-async def the_runtime_counter_advances(ctx: Context) -> None:
+@_check("thermal", "The runtime counter does not go backwards", cost=0)
+async def the_runtime_counter_is_monotonic(ctx: Context) -> None:
     """Check the state class this library assigns `worktime`, and pin down its units.
 
     Nothing to do with how long the appliance has run. `total_increasing` is a promise
     *this library* makes on the device's behalf: Home Assistant will accept the readings
     as a monotonic counter, derive long-term statistics from them, and treat a decrease
-    as a meter reset. A field that moves backwards, or never moves at all, makes it the
-    wrong state class — a bug here, in the sensor definition, whatever the hardware is
-    doing.
+    as a meter reset. A field that moves backwards makes it the wrong state class — a
+    bug here, in the sensor definition, whatever the hardware is doing.
 
-    The units have never been established either, and this is how they get established:
-    the wait ends on the first tick, so the elapsed time and the size of the step are
-    both recorded. A counter in minutes announces itself by moving by 1 after about a
-    minute. Needs the unit running but not the compressor.
+    **The window is the whole run, and it costs nothing.** This check used to sit
+    through a three-minute soak of its own waiting for a tick. Two live runs gave it
+    one: both times the counter did not move, both times it skipped, and six minutes
+    went into establishing nothing. Comparing against the state the run found gives
+    about thirteen minutes of window instead of three, for no wait at all — and thirteen
+    is long enough to be worth something. A counter in seconds would have moved by
+    roughly eight hundred and one in minutes by about thirteen, where the three-minute
+    version could not tell "minutes, and the tick was just missed" from "hours".
 
-    No tick is a result too, and the interesting half of one. A live run sat through the
-    whole deadline without the counter moving, which rules out seconds and rules out
-    minutes — so the hours this library ships it in survive, having been a guess drawn
-    from `filterthr` reading 600 beside it, which is a filter reminder in hours if it
-    is anything. Not a confirmation, and not recorded as one, but a counter too
-    coarse to catch is the outcome hours predicts and the outcome the other two units
-    rule out, so it is reported as evidence rather than as nothing.
+    So no movement over a whole run rules out seconds and minutes properly, and leaves
+    the hours this library ships it in — a guess drawn from `filterthr` reading 600
+    beside it, which is a filter reminder in hours if it is anything. Still not a
+    confirmation, and not recorded as one. What would confirm it is two runs a few days
+    apart, which is what `-o` is for: `worktime` read 2 on 2026-09-13 and 17 on
+    2026-09-27. No single run can see that, however long it waits.
     """
     if SensorKey.WORK_TIME not in ctx.caps.sensors:
         raise CheckSkippedError("model does not report a runtime counter")
-    before = ctx.state.work_time
+    found = None if ctx.baseline is None else ctx.baseline.work_time
+    before = found if found is not None else ctx.state.work_time
     if before is None:
         raise CheckSkippedError("the device reports no runtime counter")
-    waited = await ctx.until(lambda: ctx.state.work_time != before)
-    after = ctx.state.work_time
+    after = (await ctx.confirmed()).work_time
+    window = ctx.since_the_run_began()
     ctx.note(
-        work_time_before=before,
-        work_time_after=after,
-        seconds_to_tick=waited and round(waited, 1),
+        work_time_when_the_run_began=before,
+        work_time_now=after,
         step=None if after is None else after - before,
+        seconds_of_running_observed=round(window, 1),
     )
     ctx.expect(
         after is not None and after >= before,
@@ -1659,15 +1675,15 @@ async def the_runtime_counter_advances(ctx: Context) -> None:
         f"total_increasing, and a decrease makes Home Assistant read that as a meter "
         f"reset, so the state class is wrong",
     )
-    if waited is None:
-        ctx.note(units_finer_than_the_deadline=False)
+    if after == before:
+        ctx.note(units_finer_than_the_run=False)
         raise CheckSkippedError(
-            f"the counter did not move in {ctx.soak_seconds:.0f}s of running (still "
-            f"{before}), which rules out seconds and minutes and leaves the hours this "
-            f"library ships it in — consistent, unconfirmed, and as far as a run of "
-            f"this length can get"
+            f"the counter did not move in {window:.0f}s of running (still {before}), "
+            f"which rules out seconds and minutes and leaves the hours this library "
+            f"ships it in — consistent, unconfirmed, and as far as any single run can "
+            f"get. Two runs days apart would settle it, and -o records the number"
         )
-    ctx.note(units_finer_than_the_deadline=True)
+    ctx.note(units_finer_than_the_run=True)
 
 
 # --- the runner ---------------------------------------------------------------------
@@ -1740,11 +1756,9 @@ class SelfTest:
         # One settle per check for `_neutralise`, which does not always need to send
         # anything but is budgeted as though it does.
         settles = sum(check.cost + 1 for check in checks) + _PREPARE_SETTLES
-        soaks = sum(check.soaks for check in checks)
         reaches = sum(check.reaches for check in checks)
         return (
             settles * self.settle
-            + soaks * self.soak
             + reaches * min(REACH_WAIT, self.soak)
             + len(checks) * 0.5
         )
@@ -1811,6 +1825,8 @@ class SelfTest:
     async def run(self) -> list[CheckResult]:
         """Baseline, run every selected check, and restore — whatever happens."""
         self.baseline = self.device.state
+        self._context.baseline = self.baseline
+        self._context.began = time.monotonic()
         results: list[CheckResult] = []
         try:
             await self._prepare()
