@@ -208,9 +208,11 @@ decrease as a meter reset.
 were wrong. The two mode checks because each ambient reading alternates between two
 adjacent integers, so the instrument's noise is twice the smallest change either could
 look for; the runtime counter because it ticks in hours, which no wait anyone would sit
-through can see. None of those is a tuning problem, so there is no soak left in the
-budget at all — a check that wants to wait on physics has to reintroduce the idea
-deliberately.
+through can see. None of those is a tuning problem, so the budget has no line for
+waiting on the room at all — a check that wants to wait on physics has to reintroduce
+the idea deliberately. What survives is `--max-wait`, the ceiling every remaining
+deadline is clamped to; it used to be `--soak`, back when the suite thought its job was
+to let the machine run for a while.
 
 What a mode number actually claims is which setpoint that mode's thermostat compares
 against and in which direction, and the MCU answers that in about a second from two

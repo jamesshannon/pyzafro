@@ -65,17 +65,17 @@ _LOGGER = logging.getLogger(__name__)
 #: being tight costs a false pass.
 SETTLE = 6.0
 
-#: The ceiling on any single wait, and what `--soak` now sets. It began as "how long to
-#: let the machine run", which is not a thing any check does any more: nothing waits on
-#: the room, so nothing needs three minutes. It survives as the cap every other deadline
-#: is clamped to, which is also what collapses every wait to nothing in the unit tests.
-#: The name is older than the meaning and is worth changing.
+#: The ceiling on any single wait, and what `--max-wait` sets. It was called SOAK, for
+#: "how long to let the machine run", which is not a thing any check does any more:
+#: nothing waits on the room, so nothing needs three minutes. What it does now is cap
+#: every other deadline, which is also what collapses every wait to nothing in the unit
+#: tests.
 #:
 #: A deadline, not a duration, wherever it is used. Every wait ends the moment the thing
 #: it is waiting for has happened, so a healthy unit spends a fraction of any of these
 #: and only a unit that is not answering spends all of one. How long the device took is
 #: itself the measurement, and a fixed sleep throws it away.
-SOAK = 180.0
+MAX_WAIT = 180.0
 
 #: How often to look while waiting. The device pushes ambient readings on its own, but
 #: on nobody's schedule, so a wait re-reads full state at this interval rather than
@@ -97,15 +97,16 @@ POWER_DOWN = 25.0
 #: The deadline for `reachtarget`, which is a comparison the MCU makes rather than
 #: something the room has to do, so it should flip within seconds of the setpoint moving
 #: past ambient. Given its own limit so that a unit which never reports it does not cost
-#: a full soak.
+#: the whole ceiling.
 REACH_WAIT = 60.0
 
 #: Suites, in the order they run. Named for the behaviour they exercise, never for the
 #: bug that prompted them: a regression check belongs with the behaviour it protects, or
 #: the list becomes an archaeology of past issues.
 #:
-#: `thermal` is last because it is the only one that waits on physics rather than on the
-#: MCU, so an interrupted run loses the least, and because it leaves the room cold.
+#: `thermal` is last because it is the only one that drives the compressor, so an
+#: interrupted run loses the least and the room is left cold for the shortest time. It
+#: no longer waits on physics — nothing here does — but it still makes physics happen.
 SUITES: tuple[str, ...] = ("fan", "protocol", "capabilities", "liveness", "thermal")
 
 
@@ -130,14 +131,15 @@ class Check:
     cost: int
     #: Waits on the device reaching a state, budgeted at REACH_WAIT each.
     #:
-    #: There is deliberately no soak here, and no check may wait on the room. Three did
-    #: once and all three were wrong: the two mode checks because each ambient reading
-    #: alternates between two adjacent integers, so the instrument's noise is twice the
-    #: smallest change they could look for; and the runtime counter because it ticks in
-    #: hours, which no tolerable wait can see. Waiting longer fixes neither. What a
-    #: mapping claims is which numbers the MCU compares and which way round, and the MCU
-    #: answers that at once; what the appliance physically does is out of scope and is
-    #: reported as uncovered. A budget line for physics would invite a fourth.
+    #: There is deliberately no line here for waiting on the room, and no check may do
+    #: it. Three did once and all three were wrong: the two mode checks because each
+    #: ambient reading alternates between two adjacent integers, so the instrument's
+    #: noise is twice the smallest change they could look for; and the runtime counter
+    #: because it ticks in hours, which no tolerable wait can see. Waiting longer fixes
+    #: neither. What a mapping claims is which numbers the MCU compares and which way
+    #: round, and the MCU answers that at once; what the appliance physically does is
+    #: out of scope and is reported as uncovered. A budget line for physics would invite
+    #: a fourth.
     reaches: int = 0
 
 
@@ -191,13 +193,13 @@ class Context:
         device: ZafroDevice,
         *,
         settle: float = SETTLE,
-        soak: float = SOAK,
+        max_wait: float = MAX_WAIT,
         poll: float = POLL,
     ) -> None:
         """Wrap a device for one run. A `settle` of 0 is for unit tests only."""
         self.device = device
         self.settle_seconds = settle
-        self.soak_seconds = soak
+        self.max_wait_seconds = max_wait
         self.poll_seconds = poll
         #: Numbers a check pinned down, reported whatever its verdict.
         self.measured: dict[str, Any] = {}
@@ -246,15 +248,15 @@ class Context:
         the machine took is itself worth recording: it is the difference between a unit
         that is working and one that is merely not broken.
 
-        The deadline is only consulted after at least one poll, so a `soak` of 0 — which
-        is what the unit tests use — still gives the device one chance to answer rather
-        than none.
+        The deadline is only consulted after at least one poll, so a `max_wait` of 0 —
+        which is what the unit tests use — still gives the device one chance to answer
+        rather than none.
 
         Each poll re-reads full state. The device does push ambient readings unprompted,
         but nothing guarantees one lands inside the deadline, and waiting on a push that
         never comes would fail a working unit.
         """
-        deadline = self.soak_seconds if timeout is None else timeout
+        deadline = self.max_wait_seconds if timeout is None else timeout
         started = time.monotonic()
         polled = False
         while True:
@@ -762,7 +764,7 @@ async def the_off_state_keeps_the_fan_speed_it_was_given(ctx: Context) -> None:
             f"the model offers only speed {top}, so a speed written while off "
             f"cannot be told apart from the one already set"
         )
-    window = min(POWER_DOWN, ctx.soak_seconds)
+    window = min(POWER_DOWN, ctx.max_wait_seconds)
     was_power = ctx.state.power
     await ctx.command(ctx.device.async_set_fan_speed(top))
     await ctx.command(ctx.device.async_set_power(on=False))
@@ -1424,7 +1426,7 @@ async def reached_target_follows_the_setpoint(ctx: Context) -> None:
         await ctx.command(ctx.device.async_set_target_temperature(low))
         waited = await ctx.until(
             lambda: ctx.state.reached_target != satisfied,
-            timeout=min(REACH_WAIT, ctx.soak_seconds),
+            timeout=min(REACH_WAIT, ctx.max_wait_seconds),
         )
         working = ctx.state.reached_target
         ctx.note(
@@ -1501,7 +1503,7 @@ async def cool_mode_is_the_mode_that_cools(ctx: Context) -> None:
         await ctx.command(ctx.device.async_set_target_temperature(low))
         waited = await ctx.until(
             lambda: ctx.state.reached_target != above,
-            timeout=min(REACH_WAIT, ctx.soak_seconds),
+            timeout=min(REACH_WAIT, ctx.max_wait_seconds),
         )
         below = ctx.state.reached_target
     finally:
@@ -1589,7 +1591,7 @@ async def dry_mode_regulates_humidity_not_temperature(ctx: Context) -> None:
         await ctx.command(ctx.device.async_set_target_humidity(low))
         waited = await ctx.until(
             lambda: ctx.state.reached_target is not True,
-            timeout=min(REACH_WAIT, ctx.soak_seconds),
+            timeout=min(REACH_WAIT, ctx.max_wait_seconds),
         )
         after = ctx.state.reached_target
         ctx.note(
@@ -1611,7 +1613,7 @@ async def dry_mode_regulates_humidity_not_temperature(ctx: Context) -> None:
             await ctx.command(ctx.device.async_set_target_humidity(high))
             back = await ctx.until(
                 lambda: ctx.state.reached_target is True,
-                timeout=min(REACH_WAIT, ctx.soak_seconds),
+                timeout=min(REACH_WAIT, ctx.max_wait_seconds),
             )
             ctx.note(reached_target_with_humidity_satisfied=ctx.state.reached_target)
             ctx.expect(
@@ -1715,7 +1717,7 @@ class SelfTest:
         *,
         suites: Collection[str] = SUITES,
         settle: float = SETTLE,
-        soak: float = SOAK,
+        max_wait: float = MAX_WAIT,
         poll: float = POLL,
     ) -> None:
         """Prepare a run. A `settle` of 0 is for unit tests, not for hardware."""
@@ -1726,12 +1728,12 @@ class SelfTest:
         self.device = device
         self.suites = [name for name in SUITES if name in suites]
         self.settle = settle
-        self.soak = soak
+        self.max_wait = max_wait
         self.poll = poll
         self.baseline: DeviceState | None = None
         #: What the restore put back, and what it could not. Read after `run`.
         self.restored: dict[str, Any] = {}
-        self._context = Context(device, settle=settle, soak=soak, poll=poll)
+        self._context = Context(device, settle=settle, max_wait=max_wait, poll=poll)
 
     # --- planning --------------------------------------------------------------------
 
@@ -1759,7 +1761,7 @@ class SelfTest:
         reaches = sum(check.reaches for check in checks)
         return (
             settles * self.settle
-            + reaches * min(REACH_WAIT, self.soak)
+            + reaches * min(REACH_WAIT, self.max_wait)
             + len(checks) * 0.5
         )
 
@@ -1785,17 +1787,21 @@ class SelfTest:
                 self.device,
                 suites=[s for s in self.suites if s != "thermal"],
                 settle=self.settle,
-                soak=self.soak,
+                max_wait=self.max_wait,
             )
+            # Both numbers are read off the checks rather than written here, because
+            # the last two edits to the thermal suite each left one of them stale: it
+            # promised four waits when three were left, and quoted the ceiling
+            # when every wait in it is clamped to REACH_WAIT.
+            waits = sum(c.reaches for c in self.checks() if c.suite == "thermal")
+            each = min(REACH_WAIT, self.max_wait)
             lines += [
                 "",
                 "The thermal suite WILL run the compressor and dehumidify, at the",
-                "bottom of the setpoint range. Each of its four waits ends as soon as",
-                f"the unit has responded, or gives up after {self.soak:.0f}s — so the",
-                (
-                    f"estimate above is a ceiling. Without it the run is about "
-                    f"{without.estimate() / 60:.0f} min."
-                ),
+                f"bottom of the setpoint range. Each of its {waits} waits ends",
+                f"as soon as the unit has responded, or gives up after {each:.0f}s,",
+                "so the estimate above is a ceiling. Without it the run is about",
+                f"{without.estimate() / 60:.0f} min.",
             ]
         lines += [
             "",

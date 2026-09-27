@@ -404,9 +404,9 @@ async def _run(transport: FakeUnit, **kwargs: Any) -> Any:
     device = _device(transport, kwargs.pop("raw", RAW))
     await device.async_refresh()
     kwargs.setdefault("settle", 0)
-    # A soak of 0 still gives the device one poll, which is all the fake needs: it does
-    # a soak's worth of work per command rather than per second.
-    kwargs.setdefault("soak", 0)
+    # A max wait of 0 still gives the device one poll, which is all the fake needs: it
+    # does a wait's worth of work per command rather than per second.
+    kwargs.setdefault("max_wait", 0)
     kwargs.setdefault("poll", 0)
     runner = SelfTest(device, **kwargs)
     try:
@@ -552,7 +552,7 @@ async def test_an_unexpected_exception_is_recorded_not_raised(unit):
     """A broken check must not take the run, or the restore, down with it."""
     device = _device(unit)
     await device.async_refresh()
-    runner = SelfTest(device, suites=["fan"], settle=0, soak=0)
+    runner = SelfTest(device, suites=["fan"], settle=0, max_wait=0)
 
     async def explode(_: Context) -> None:
         raise RuntimeError("the check itself is broken")
@@ -577,7 +577,7 @@ async def test_the_unit_is_restored_to_what_it_was_found_in(unit):
     await device.async_refresh()
     before = device.state
 
-    runner = SelfTest(device, settle=0, soak=0)
+    runner = SelfTest(device, settle=0, max_wait=0)
     await runner.run()
     device.close()
 
@@ -596,7 +596,7 @@ async def test_a_unit_found_off_is_powered_back_off_last(unit):
     device = _device(unit)
     await device.async_refresh()
 
-    runner = SelfTest(device, settle=0, soak=0)
+    runner = SelfTest(device, settle=0, max_wait=0)
     await runner.run()
     device.close()
 
@@ -614,7 +614,7 @@ async def test_the_unit_is_restored_even_when_a_check_explodes(unit):
     device = _device(unit)
     await device.async_refresh()
     before = device.state
-    runner = SelfTest(device, suites=["fan"], settle=0, soak=0)
+    runner = SelfTest(device, suites=["fan"], settle=0, max_wait=0)
 
     async def explode(ctx: Context) -> None:
         await ctx.device.async_set_sleep(on=True)
@@ -652,7 +652,7 @@ async def test_a_restore_that_did_not_take_is_reported():
     device = _device(unit)
     await device.async_refresh()
 
-    runner = SelfTest(device, suites=["fan"], settle=0, soak=0)
+    runner = SelfTest(device, suites=["fan"], settle=0, max_wait=0)
     await runner.run()
     device.close()
 
@@ -732,8 +732,9 @@ async def test_the_waits_dominate_the_estimate(unit):
     """Someone told five minutes and kept for twenty will not run this again.
 
     Against the settling between commands, which is the other thing the estimate is
-    made of. Stated structurally rather than as a multiple of `--soak`, because only one
-    thermal check waits on a soak now and the rest are budgeted a minute each.
+    made of. Stated structurally rather than as a multiple of `--max-wait`, because no
+    check spends the ceiling any more: every thermal wait is clamped to REACH_WAIT, and
+    one of the four checks waits for nothing at all.
     """
     device = _device(unit)
     thermal = SelfTest(device, suites=["thermal"])
@@ -951,7 +952,7 @@ async def test_an_excursion_leaves_the_setpoint_satisfied_behind_it():
     transport = FakeUnit()
     device = _device(transport)
     await device.async_refresh()
-    runner = SelfTest(device, suites=["capabilities"], settle=0, soak=0)
+    runner = SelfTest(device, suites=["capabilities"], settle=0, max_wait=0)
     await runner.run()
     device.close()
 
@@ -1033,10 +1034,11 @@ async def test_the_cool_check_reads_the_thermostat_and_not_the_room():
 
     The ambient reading alternates between two adjacent integers, so two live runs of
     that version disagreed on the same unit in the same room: a pass in 0.0 seconds off
-    a reading on its way down, then a failure after the full soak. What the mapping
+    a reading on its way down, then a failure after the whole wait. What the mapping
     claims is which way round the thermostat is satisfied, which the MCU answers at
     once — so the check is budgeted a `reaches` deadline and never reads
-    `ambient_temperature` for a verdict. There is no soak left to carry instead.
+    `ambient_temperature` for a verdict. There is no room-waiting budget to carry
+    instead, which is the point of having deleted the field.
     """
     cooling = next(c for c in CHECKS if c.suite == "thermal" and "cool_mode" in c.name)
     assert not hasattr(cooling, "soaks")
@@ -1172,7 +1174,7 @@ async def test_a_wait_ends_as_soon_as_the_machine_has_responded(unit):
     """
     device = _device(unit)
     await device.async_refresh()
-    ctx = Context(device, settle=0, soak=30.0, poll=0)
+    ctx = Context(device, settle=0, max_wait=30.0, poll=0)
 
     calls = 0
 
@@ -1193,16 +1195,16 @@ async def test_a_wait_that_times_out_says_so_rather_than_passing(unit):
     """A deadline that succeeded on expiry would make every thermal check pass."""
     device = _device(unit)
     await device.async_refresh()
-    ctx = Context(device, settle=0, soak=0, poll=0)
+    ctx = Context(device, settle=0, max_wait=0, poll=0)
     assert await ctx.until(lambda: False) is None
     device.close()
 
 
 async def test_a_wait_gives_the_device_at_least_one_look(unit):
-    """A soak of 0 must still poll once, or every unit test would time out at zero."""
+    """A max wait of 0 must still poll once, or every unit test would time out."""
     device = _device(unit)
     await device.async_refresh()
-    ctx = Context(device, settle=0, soak=0, poll=0)
+    ctx = Context(device, settle=0, max_wait=0, poll=0)
     looks = 0
 
     def ready() -> bool:
@@ -1300,7 +1302,7 @@ async def test_a_clamped_bound_does_not_hide_the_narrowness_probe_behind_it():
 
 async def test_a_deferred_failure_outranks_a_later_skip():
     """A check that walks past a failure and then gives up has still found one."""
-    ctx = Context(_device(FakeUnit()), settle=0, soak=0, poll=0)
+    ctx = Context(_device(FakeUnit()), settle=0, max_wait=0, poll=0)
 
     async def walks_then_skips(_ctx: Context) -> None:
         _ctx.expect_but_continue(condition=False, detail="the first claim was wrong")
@@ -1313,7 +1315,7 @@ async def test_a_deferred_failure_outranks_a_later_skip():
         run=walks_then_skips,
         cost=0,
     )
-    runner = SelfTest(ctx.device, settle=0, soak=0, poll=0)
+    runner = SelfTest(ctx.device, settle=0, max_wait=0, poll=0)
     runner._context = ctx
     result = await runner._run_one(check)
     ctx.device.close()

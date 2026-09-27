@@ -51,7 +51,7 @@ from .models import (
     Origin,
     parse_state,
 )
-from .selftest import SETTLE, SOAK, SUITES, CheckResult, SelfTest, summarise
+from .selftest import MAX_WAIT, SETTLE, SUITES, CheckResult, SelfTest, summarise
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -462,7 +462,7 @@ async def _cmd_selftest(args: argparse.Namespace) -> int:
             device,
             suites=args.suite or SUITES,
             settle=args.settle,
-            soak=args.soak,
+            max_wait=args.max_wait,
         )
         runner.baseline = device.state
 
@@ -677,9 +677,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="seconds to wait after each command before believing the device",
     )
     selftest.add_argument(
-        "--soak",
+        "--max-wait",
         type=float,
-        default=SOAK,
+        default=MAX_WAIT,
         help=(
             "the ceiling on any single wait. Every wait ends as soon as the unit has "
             "answered, so this is a deadline rather than a duration, and no check "

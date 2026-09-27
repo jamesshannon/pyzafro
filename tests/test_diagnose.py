@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 from typing import Any
 
 import pytest
 
 from pyzafro.device import ZafroDevice
-from pyzafro.diagnose import Recorder, _parse_assignment
+from pyzafro.diagnose import Recorder, _build_parser, _parse_assignment
+from pyzafro.selftest import MAX_WAIT, SETTLE, SelfTest
 
 RAW = {
     "sn": "6ISEComboWF020BSJ0000000000",
@@ -95,3 +97,21 @@ def test_recorder_collects_value_ranges(device):
 )
 def test_assignment_parsing(text, expected):
     assert _parse_assignment(text) == expected
+
+
+def test_the_wait_ceiling_reaches_the_runner_under_the_name_the_cli_uses():
+    """The flag and the keyword are the same setting and were renamed together.
+
+    Nothing else exercises this hop. `--max-wait` parses whatever it is called, so a
+    flag whose name no longer matches the attribute `_cmd_selftest` reads fails with an
+    AttributeError — after a login, a baseline read and the consent prompt, on hardware,
+    which is the worst place to find a typo. Both ends are asserted here instead.
+    """
+    args = _build_parser().parse_args(
+        ["selftest", "-e", "someone@example.invalid", "--max-wait", "12"],
+    )
+    assert args.max_wait == 12.0
+    assert inspect.signature(SelfTest.__init__).parameters["max_wait"].default == (
+        MAX_WAIT
+    )
+    assert args.settle == SETTLE
