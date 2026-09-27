@@ -152,6 +152,92 @@ The tool cannot see the hardware. For a physically visible question — which wa
 moves, whether the fan really stops — it makes the causal link unambiguous and leaves the
 observation to you.
 
+```bash
+pyzafro-diagnose selftest -e you@example.com
+```
+
+Drives a real unit through this library's own setters and checks it still behaves the way
+the library says it does. `probe` tests the device and leaves the write path, capability
+validation and optimistic reconciliation untouched; this exercises all of them, which is
+where the bugs have actually been.
+
+This is the full integration suite, not a smoke test. It is meant to be run rarely and
+deliberately — once before a release, or after a bug that got past the unit tests — and it
+is thorough in preference to quick or gentle. Twenty-five minutes at worst, usually much
+less, and it runs the machine.
+
+| suite | checks | what it exercises |
+|---|---|---|
+| `fan` | 9 | the fan control's positions and every transition between them |
+| `protocol` | 8 | the changes the device makes that nobody asked for |
+| `capabilities` | 11 | whether the table still describes this device, and whether its ranges are real |
+| `liveness` | 6 | the assumptions optimistic writes rest on |
+| `thermal` | 4 | the mappings that cannot be read without letting the unit run |
+
+Selectable and repeatable with `--suite`, all of them by default. The first four take
+about twelve minutes between them and never leave the thermostat unsatisfied for more than
+a settle. `thermal` is all of the electricity and most of the clock: each of its four waits
+ends the moment the unit has responded and gives up after `--soak` (three minutes), so the
+printed estimate is a ceiling and a healthy unit finishes well inside it.
+
+**It runs the machine.** It prints what it will change, asks before starting, and restores
+every field afterwards — including after a failure or a Ctrl-C — then re-reads the device
+and reports anything that did not go back. Between checks it clears sleep, EXTRA and eco
+and parks the setpoint at its maximum, so the compressor only runs where a check is about
+the compressor.
+
+None of this tests the appliance. How well a unit cools, or whether it needs servicing, is
+a fact about somebody's hardware and no business of this library's. What *is* its business
+is that some of its own mappings were never verified against anything — and a few of those
+happen to be unreadable from a unit whose thermostat is satisfied, which is the state every
+other suite arranges.
+
+`Mode.COOL = 1` was read off a switch statement in decompiled Dart, and every other check
+would pass with the enum shuffled: commanding mode 1 and reading mode 1 back proves the
+device accepts the number, never that the number means cooling. `Mode` labels the entire
+HVAC dropdown, so a mislabelled member puts "Cool" on the button that dehumidifies and
+nothing reports an error. The only instrument for reading what a mode number means is the
+direction the room moves. Likewise `reachtarget`, which gets a binary sensor named after a
+behaviour nobody has watched it perform, and `worktime`, which ships as `total_increasing`
+— a promise this library makes on the device's behalf that Home Assistant will read a
+decrease as a meter reset.
+
+Where a physical consequence is the only available instrument, a check reads it and says so.
+Where it cannot tell a wrong mapping from a unit that simply is not cooling, it names both
+and says which one is in scope.
+
+Every check reports what it measured, pass or fail, because pinning down a number the
+table only guesses at is half the reason to run it — including how long the machine took,
+which is how `worktime`'s units get established at all:
+
+```
+  PASS  protocol      extra_moves_the_setpoint_within_the_claimed_range  (12s)
+        setpoint_under_extra = 61
+        table_floor = 60
+  PASS  thermal       the_runtime_counter_advances  (63s)
+        work_time_before = 1200
+        work_time_after = 1201
+        seconds_to_tick = 61.4
+        step = 1
+```
+
+Two checks deliberately bypass validation, and only these two: the setpoint and humidity
+ranges are probed one step past each end with a raw frame. Every other check can find a
+range that is too *wide*, because the library offers a value and the device clamps it.
+None can find one that is too narrow, because the library refuses out-of-range values
+before they reach the wire — so a unit happily accepting 58 would never be asked, and its
+owner would simply never be offered a setting their hardware has.
+
+What a passing run still does not cover is stated rather than implied: the Celsius mapping
+(`tempunit` is read-only), the fault-code vocabulary and the water and filter readings
+(cannot be induced), availability (needs the plug pulled), and which louvre `oscset1`
+moves (needs eyes on the unit).
+
+A failure means a claim in this library that your hardware does not support — a different
+firmware, or a model the table describes wrongly. `-o results.json` writes the run with
+the same redaction as `report`: no serial, MAC, wifi name or room name. Attach it to an
+issue.
+
 ## Unsupported models
 
 Capabilities live in `capabilities.py`, keyed by model string. An unknown model still

@@ -13,6 +13,12 @@ Three subcommands:
     Send one change and record everything the device does in response. This is how an
     ambiguous field gets pinned down — set it, watch the unit, read the trace.
 
+``selftest``
+    Drive a real unit through the library's own setters and check it still behaves the
+    way the library says it does. This is what catches a protocol assumption that has
+    gone stale, which the unit tests cannot. It is the full integration suite: rare,
+    thorough, and it runs the machine — compressor included — so it asks first.
+
 Nothing here is imported by ``pyzafro/__init__.py``; the library never loads it.
 """
 
@@ -45,6 +51,7 @@ from .models import (
     Origin,
     parse_state,
 )
+from .selftest import SETTLE, SOAK, SUITES, CheckResult, SelfTest, summarise
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -440,6 +447,139 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- selftest ------------------------------------------------------------------------
+
+
+_OUTCOME_MARKS = {"pass": "PASS", "fail": "FAIL", "skip": "skip", "error": "ERR "}
+
+
+async def _cmd_selftest(args: argparse.Namespace) -> int:
+    session, listener, devices = await _connect(args)
+    device = devices[0]
+    try:
+        await _baseline(device)
+        runner = SelfTest(
+            device,
+            suites=args.suite or SUITES,
+            settle=args.settle,
+            soak=args.soak,
+        )
+        runner.baseline = device.state
+
+        print(file=sys.stderr)
+        for line in runner.plan():
+            print(f"  {line}", file=sys.stderr)
+        print(file=sys.stderr)
+
+        if (reason := runner.refuse_reason()) is not None:
+            print(f"Not running: {reason}", file=sys.stderr)
+            return 2
+        if not args.yes and not _confirm():
+            print("Nothing was changed.", file=sys.stderr)
+            return 1
+
+        results = await runner.run()
+    finally:
+        await _shutdown(session, listener)
+
+    _print_selftest_results(results)
+    _print_restore(runner)
+    failed = [r for r in results if r.outcome in {"fail", "error"}]
+    if args.out:
+        _emit_selftest(device, runner, results, args.out)
+    return 1 if failed else 0
+
+
+def _print_restore(runner: SelfTest) -> None:
+    """Say whether the unit came back to how it was found.
+
+    Printed on every run, including a clean one. The promise to put the hardware back is
+    the reason the run was permitted, and "it went back" is worth one line.
+    """
+    if not runner.restored:
+        print("\nThe unit was restored to the state it was found in.")
+        return
+    print("\n--- the unit did NOT fully go back ---")
+    for name, values in sorted(runner.restored.items()):
+        print(f"  {name}: found {values['wanted']!r}, left at {values['got']!r}")
+    print("  Set these by hand, or from the app.")
+
+
+def _print_selftest_results(results: list[CheckResult]) -> None:
+    """Print one line per check, then the frames behind anything that went wrong."""
+    print("--- checks ---")
+    for result in results:
+        mark = _OUTCOME_MARKS[result.outcome]
+        print(f"  {mark}  {result.suite:<12} {result.name}  ({result.seconds:.0f}s)")
+        if result.detail:
+            print(f"        {result.claim}")
+            print(f"        -> {result.detail}")
+        # Printed for a pass as well. Several checks exist to pin down a number the
+        # table only guesses at — the real setpoint floor, the units of the runtime
+        # counter — and a bare PASS throws away the thing worth reading.
+        for key, value in result.measured.items():
+            print(f"        {key} = {value!r}")
+
+    counts = summarise(results)
+    print(
+        f"\n{counts['pass']} passed, {counts['fail']} failed, "
+        f"{counts['skip']} skipped, {counts['error']} errored"
+    )
+
+    failed = [r for r in results if r.outcome in {"fail", "error"}]
+    if not failed:
+        return
+
+    print("\n--- frames seen during each failure ---")
+    for result in failed:
+        print(f"\n  {result.name}")
+        for frame in result.trace:
+            if frame["cmd"] not in {CMD_STATE, CMD_STATE_PUSH}:
+                continue
+            who = _origin_name(frame["result"].get("origin"))
+            fields = {k: v for k, v in frame["result"].items() if k != "origin"}
+            print(f"    +{frame['at']:6.2f}s  {who:<9} {json.dumps(fields)}")
+    print(
+        "\nA failure here is a claim in this library the hardware no longer supports. "
+        "Please open an issue with the output above — it names no serial, MAC or wifi "
+        "network."
+    )
+
+
+def _emit_selftest(
+    device: ZafroDevice,
+    runner: SelfTest,
+    results: list[CheckResult],
+    out: str,
+) -> None:
+    """Write the run as JSON, redacted the same way a report is."""
+    payload = {
+        "pyzafro_version": __version__,
+        "device": device.diagnostics(),
+        "suites": runner.suites,
+        "counts": summarise(results),
+        "restored": runner.restored,
+        "results": [asdict(result) for result in results],
+    }
+    Path(out).write_text(
+        json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8"
+    )
+    print(f"\nWrote {out}", file=sys.stderr)
+
+
+def _confirm() -> bool:
+    """Ask before moving someone's air conditioner.
+
+    Anything but an explicit yes is a no, including a closed stdin — a run that cannot
+    ask is a run that has not been permitted.
+    """
+    try:
+        answer = input("Run this against the unit? [y/N] ")
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer.strip().lower() in {"y", "yes"}
+
+
 def _state_line(state: DeviceState) -> str:
     parts = [
         f"{field}={_show(value)}"
@@ -511,6 +651,49 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     probe.add_argument("--observe", type=int, default=20)
     probe.set_defaults(func=_cmd_probe)
+
+    selftest = sub.add_parser(
+        "selftest", help="check a real unit still behaves as this library claims"
+    )
+    common(selftest)
+    selftest.add_argument(
+        "--suite",
+        action="append",
+        choices=SUITES,
+        help=(
+            "which suite to run; repeatable, and all of them by default. "
+            "fan: the fan control's positions and the transitions between them. "
+            "protocol: the changes the device makes that nobody asked for. "
+            "capabilities: whether the table still describes this device. "
+            "liveness: the assumptions behind optimistic writes. "
+            "thermal: the claims that need the machine actually working, which is "
+            "most of the run's time and all of its electricity."
+        ),
+    )
+    selftest.add_argument(
+        "--settle",
+        type=float,
+        default=SETTLE,
+        help="seconds to wait after each command before believing the device",
+    )
+    selftest.add_argument(
+        "--soak",
+        type=float,
+        default=SOAK,
+        help=(
+            "how long to wait AT MOST for the machine to do something measurable, for "
+            "the thermal suite. Every wait ends as soon as the unit responds, so this "
+            "is a deadline rather than a duration; ambient temperature is reported in "
+            "whole degrees, so too short a deadline fails a working unit"
+        ),
+    )
+    selftest.add_argument(
+        "--yes",
+        action="store_true",
+        help="skip the confirmation prompt; for repeated runs against your own unit",
+    )
+    selftest.add_argument("-o", "--out", help="also write the results as JSON")
+    selftest.set_defaults(func=_cmd_selftest)
     return parser
 
 
