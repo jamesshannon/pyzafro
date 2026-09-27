@@ -19,6 +19,7 @@ from pyzafro.capabilities import Feature, resolve
 from pyzafro.device import ZafroDevice
 from pyzafro.selftest import (
     CHECKS,
+    POWER_DOWN,
     REACH_WAIT,
     SUITES,
     Check,
@@ -102,8 +103,9 @@ class FakeUnit:
         tracks_target: bool = True,
         runtime_step: int = 1,
         holds_speed_zero: bool = False,
-        keeps_settings_while_off: bool = True,
-        parks_fan_when_off: bool = False,
+        keeps_settings_while_off: bool = False,
+        parks_fan_when_off: bool = True,
+        parks_after_reads: int = 0,
         allows_programmes_in_fan_mode: bool = False,
         reports_origin: bool = True,
         silent_keys: tuple[str, ...] = (),
@@ -132,13 +134,17 @@ class FakeUnit:
         self.tracks_target = tracks_target
         self.runtime_step = runtime_step
         self.holds_speed_zero = holds_speed_zero
-        #: Both default to what a live run found and what both READMEs now say: the fan
-        #: does not park when the unit is powered down, and a speed written while off
-        #: sticks. The opposite of each was assumed until that run, and `_restore` still
-        #: sends settings before power on the strength of the older reading, which costs
-        #: nothing and cannot be wrong either way.
         self.keeps_settings_while_off = keeps_settings_while_off
+        #: Whether powering down drops the fan to its slowest speed, which is why Low
+        #: shows while off.
         self.parks_fan_when_off = parks_fan_when_off
+        #: How many full reads a power-down takes before the fan parks, which is what
+        #: the window unit's twenty-second turn-off timer looks like to a check that
+        #: polls. Zero parks at once; one means the first read after the power-off still
+        #: reports the speed the unit was running at, which is what a check that reads
+        #: straight away mistakes for a unit that does not park at all.
+        self.parks_after_reads = parks_after_reads
+        self._parking_in: int | None = None
         self.allows_programmes_in_fan_mode = allows_programmes_in_fan_mode
         self.reports_origin = reports_origin
         #: Wire keys this unit drops in total silence: no acknowledgement and no
@@ -214,9 +220,11 @@ class FakeUnit:
     def _replies_to(self, payload: dict[str, Any]) -> list[tuple[int, dict[str, Any]]]:
         cmd = payload["cmd"]
         if cmd == 3:
-            # A full read is also the moment a real unit's counter has advanced,
-            # which is a function of time rather than of anything commanded.
+            # A full read is also the moment a real unit's counter has advanced, and the
+            # moment a power-down still running its timer has had time to finish. Both
+            # are functions of time rather than of anything commanded.
             self._tick()
+            self._finish_parking()
             self._recompute()
             return [(3, self._stamp(dict(self.wire), 0))]
         if cmd == 5:
@@ -291,8 +299,14 @@ class FakeUnit:
     def _side_effects(self, key: str, value: Any, previous: Any) -> bool:
         """Apply what the unit does off its own bat. Returns whether sleep was left."""
         if key == "poweron" and not value:
-            if self.parks_fan_when_off:
+            if not self.parks_fan_when_off:
+                pass
+            elif self.parks_after_reads:
+                self._parking_in = self.parks_after_reads
+            else:
                 self._move("windlevel", _OFF_SPEED)
+        elif key == "poweron" and value:
+            self._parking_in = None
         elif key == "sleep" and value and not previous:
             self._saved_speed = self.wire["windlevel"]
             self._move("windlevel", 0)
@@ -311,6 +325,21 @@ class FakeUnit:
             self._move("windlevel", 1)
             self._move("templevel", 76)
         return False
+
+    def _finish_parking(self) -> None:
+        """Let a power-down that takes a while get as far as parking the fan.
+
+        A read at a time, because the fake has no clock and a check that waits out the
+        turn-off timer is a check that polls. So "the state after the timer" and "the
+        state after another full read" are the same thing here.
+        """
+        if self._parking_in is None:
+            return
+        if self._parking_in > 0:
+            self._parking_in -= 1
+            return
+        self._parking_in = None
+        self._move("windlevel", _OFF_SPEED)
 
     def _tick(self) -> None:
         """Advance the runtime counter, which a full read is a chance to notice."""
@@ -785,51 +814,54 @@ async def test_the_refusal_is_also_how_reconciliation_gets_exercised():
     assert "no override here to reconcile" in overridden.detail
 
 
-async def test_the_off_state_both_readmes_describe_is_a_pass():
-    """The claim is the way round the live run left it, so the default unit passes.
-
-    Powered down at its top speed the unit reported the top speed, and a speed written
-    while off was kept. Both READMEs now tell users that, so a unit doing it is not a
-    finding — and the version of this check that asserted the opposite failed a unit
-    that was behaving exactly as documented.
-    """
-    _, results = await _run(FakeUnit())
-    off = _one(results, "the_off_state_keeps_the_fan_speed_it_was_given")
-    assert off.outcome == "pass"
-
-
-async def test_a_setting_discarded_while_off_is_a_failure():
-    """`_restore` sends settings before power on the strength of the older reading.
-
-    A unit that throws a write away while off makes that ordering a requirement again
-    rather than the precaution it was demoted to, and makes both READMEs wrong about
-    what an off unit reports.
-    """
-    _, results = await _run(FakeUnit(keeps_settings_while_off=False))
+async def test_a_unit_that_keeps_settings_while_off_is_a_failure():
+    """`_restore` orders its frames on this, so the tool depends on it being true."""
+    _, results = await _run(FakeUnit(keeps_settings_while_off=True))
     off = _one(results, "the_off_state_keeps_the_fan_speed_it_was_given")
     assert off.outcome == "fail"
-    assert "the write was discarded" in off.detail
-    # The evidence, not just the verdict: the speed read back is the one the unit was
-    # already at, which is only visible because a different speed was written.
+    assert "_restore is ordering its frames for no reason" in off.detail
     assert (
         off.measured["fan_speed_read_back_while_off"]
-        == off.measured["fan_speed_while_off"]
+        == off.measured["fan_speed_written_while_off"]
     )
 
 
-async def test_the_speed_written_while_off_is_not_the_one_already_set():
+@pytest.mark.parametrize("parks", [True, False])
+async def test_the_speed_written_while_off_is_never_one_already_set(*, parks: bool):
     """The first version of this check wrote the top speed to a unit already at it.
 
     So the read-back was the same number whether the write landed or was thrown away,
     and it reported "settings do stick after all" on evidence that could not tell the
-    two apart. The speed it writes has to differ from the speed it will be compared to.
+    two apart. Picking the slowest speed instead has the same problem the other way up,
+    against a unit that parks, so the speed has to be chosen after the first reading and
+    against whatever the unit turned out to report. Asserted both ways round for that
+    reason.
     """
-    _, results = await _run(FakeUnit(keeps_settings_while_off=False))
+    _, results = await _run(FakeUnit(parks_fan_when_off=parks))
     off = _one(results, "the_off_state_keeps_the_fan_speed_it_was_given")
     assert (
         off.measured["fan_speed_while_off"]
         != off.measured["fan_speed_written_while_off"]
     )
+
+
+async def test_a_power_down_that_takes_its_time_is_waited_out():
+    """The window unit runs a turn-off timer of about twenty seconds.
+
+    The fan is still going for all of it, so a reading taken inside that window is of a
+    unit shutting down and not of a unit that is off. The live run read at 5.5s and then
+    at 12.1s and powered the unit back on at 12.7s, and reported a unit that does not
+    park its fan — from a fan that had not finished stopping. Both READMEs were changed
+    on that, and changed back.
+    """
+    assert POWER_DOWN > 20.0
+    _, results = await _run(FakeUnit(parks_after_reads=1))
+    off = _one(results, "the_off_state_keeps_the_fan_speed_it_was_given")
+
+    assert off.outcome == "pass"
+    # The park lands on the second read, so the first one alone would have called this a
+    # unit that keeps its speed through a power-down.
+    assert off.measured["fan_speed_while_off"] == 1
 
 
 async def test_a_device_that_stops_reporting_origin_is_a_failure():
@@ -1258,25 +1290,33 @@ async def test_the_off_state_check_asks_the_device_rather_than_its_own_optimism(
     Both halves are about a value the library sent and the device did not mention, so
     the merged state is this library quoting itself. Only a full re-read can settle it.
     """
-    transport = FakeUnit(parks_fan_when_off=True)
+    transport = FakeUnit(keeps_settings_while_off=True)
     _, results = await _run(transport)
     off = _one(results, "the_off_state_keeps_the_fan_speed_it_was_given")
 
     assert off.outcome == "fail"
-    assert "it parks the fan" in off.detail
-    # Its own trace has to carry the full-state replies, one per reading it took. A
-    # merged-state read would answer from the library's optimism and never ask.
-    assert sum(frame["cmd"] == 3 for frame in off.trace) == 2
+    assert "_restore is ordering its frames for no reason" in off.detail
+    # There has to be a full read after the last speed the check wrote, because that is
+    # the value merged state would answer from the library's own optimism.
+    frames = off.trace
+    last_ack = max(
+        i
+        for i, frame in enumerate(frames)
+        if frame["cmd"] == 4 and "windlevel" in frame["result"]
+    )
+    assert any(frame["cmd"] == 3 for frame in frames[last_ack + 1 :])
 
 
-async def test_a_unit_that_parks_the_fan_when_off_is_reported_too():
+async def test_a_unit_that_does_not_park_the_fan_is_reported_too():
     """The other half of the same claim, which the check used to measure and not assert.
 
-    Both READMEs tell users that a speed shown while off is whatever it was last set to.
-    A unit that drops to its slowest speed when powered down makes that advice wrong.
+    Both READMEs tell users that Low while off is the parked speed rather than a stale
+    reading. A unit that holds its running speed through a power-down makes that wrong —
+    but only if the reading was taken after the turn-off timer, which is why this fake
+    parks never rather than late.
     """
-    _, results = await _run(FakeUnit(holds_speed_zero=True, parks_fan_when_off=True))
+    _, results = await _run(FakeUnit(holds_speed_zero=True, parks_fan_when_off=False))
     off = _one(results, "the_off_state_keeps_the_fan_speed_it_was_given")
 
     assert off.outcome == "fail"
-    assert "it parks the fan" in off.detail
+    assert "it does not park the fan" in off.detail

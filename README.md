@@ -163,8 +163,8 @@ where the bugs have actually been.
 
 This is the full integration suite, not a smoke test. It is meant to be run rarely and
 deliberately — once before a release, or after a bug that got past the unit tests — and it
-is thorough in preference to quick or gentle. Fifteen minutes at worst, usually eleven
-or twelve, and it runs the machine.
+is thorough in preference to quick or gentle. Sixteen minutes at worst, usually eleven or
+twelve, and it runs the machine.
 
 | suite | checks | what it exercises |
 |---|---|---|
@@ -253,14 +253,22 @@ That second one is from the first live run, and is what the table now says. It m
 numbers: the setpoint floor from 60 to 61, the humidity ceiling from 80 to 70, and the
 display light off the window unit's feature list entirely — it reports `lighton` and
 ignores every command to it, so the switch built from that field did nothing. Both READMEs
-lost a claim too: fan mode turns down sleep, but accepts Extra and eco, and a unit powered
-down does not necessarily park its fan.
+lost a claim too: fan mode turns down sleep, but accepts Extra and eco.
 
 The second run, with those four corrections in, passed 34 of 38 and left two failures that
 were both bugs in this suite rather than in the library: the cooling check described above,
 and an off-state check that wrote the fan speed the unit was already at and treated the
 read-back as evidence. Which is the other thing a rare, thorough run buys — the checks get
 audited by the hardware they audit.
+
+A third thing the runs found, and neither of them noticed, is that this unit takes about
+twenty seconds to finish switching off, with the fan running for all of it. The off-state
+check read at 5.5 seconds and again at 12.1, and powered the unit back on at 12.7, so it
+never saw the unit off; both of its conclusions were about a fan that had not stopped yet,
+and one of them had reached both READMEs before the timer came up. It waits past the timer
+now, and what an off unit really reports is unmeasured. A check that reads a state the
+device takes time to reach has to be told how long that is — the deadline is not always the
+one you were thinking about.
 
 Two checks deliberately bypass validation, and only these two: the setpoint and humidity
 ranges are probed one step past each end with a raw frame. Every other check can find a

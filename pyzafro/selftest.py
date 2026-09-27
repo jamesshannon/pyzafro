@@ -83,6 +83,18 @@ SOAK = 180.0
 #: trusting a push to arrive inside the deadline.
 POLL = 15.0
 
+#: How long a power-down needs before the state it leaves behind is the off state. The
+#: window unit runs a turn-off timer of about twenty seconds — the fan keeps going while
+#: the unit winds down — so anything read inside that window is a unit still shutting
+#: down and says nothing about a unit that is off. A settle is nowhere near it, and the
+#: first version of the off-state check read at 5.5s and again at 12.1s, then powered
+#: the unit back on at 12.7s. It never once saw the unit off.
+#:
+#: Rounded up past the timer, and the poll interval takes the real wait past it again. A
+#: fixed window rather than a pure deadline, because "the fan never parked" can only be
+#: concluded once the window has closed.
+POWER_DOWN = 25.0
+
 #: The deadline for `reachtarget`, which is a comparison the MCU makes rather than
 #: something the room has to do, so it should flip within seconds of the setpoint moving
 #: past ambient. Given its own limit so that a unit which never reports it does not cost
@@ -687,28 +699,44 @@ async def sleep_is_refused_in_fan_mode(ctx: Context) -> None:
             await ctx.command(ctx.device.async_set_mode(was_mode))
 
 
-@_check("protocol", "A unit that is off keeps the fan speed it was given", cost=4)
+# Budgeted a `reaches` rather than more settles: the two windows below come to 40s at
+# most and one `reaches` is 60s, which is the safe direction to be wrong in for a number
+# somebody is consenting to.
+@_check(
+    "protocol",
+    "A unit that is off reports and keeps the fan speed it was given",
+    cost=4,
+    reaches=1,
+)
 async def the_off_state_keeps_the_fan_speed_it_was_given(ctx: Context) -> None:
-    """Check the two halves of what an off unit does with a speed, both now documented.
+    """Check the two claims the off state rests on, one of which this tool relies on.
 
-    Both were assumed the other way round until a live run, and both READMEs said so:
-    that the fan parks at its slowest speed when the unit is powered down, and that a
-    setting written to a unit that is off is discarded. `_restore` was built on the
-    second, sending settings before power when the unit was found off, because the other
-    order would silently lose them.
+    Whether the fan parks at its slowest speed when the unit is powered down, and
+    whether a setting written to a unit that is off is kept. `_restore` is built on the
+    second: it sends settings before power when the unit was found off, because the
+    other order would silently lose them. A tool whose promise to put things back
+    depends on an assumption should check the assumption.
 
-    Powered down at its top speed the unit reported the top speed, and a speed written
-    while off was acknowledged and never corrected. So the claim is the other way up
-    now, and this is what asserts the version the READMEs tell users: the fan does not
-    park, and a write while off sticks. A unit that parks or discards is a firmware this
-    documentation is wrong about, and it makes `_restore`'s ordering load-bearing again
-    rather than the precaution it was demoted to.
+    **Both readings have to wait out the turn-off timer**, which is what the first two
+    versions of this check got wrong and what makes everything either of them concluded
+    unusable. The window unit takes about twenty seconds to finish shutting down, with
+    the fan still running; the check read at 5.5s and again at 12.1s and then powered
+    the unit back on at 12.7s, so it never saw the unit off. What it recorded as "this
+    unit does not park its fan" was a fan still spinning down, which is what a shutdown
+    looks like, and the write it called sticky landed on a unit that had not finished
+    going off. Both READMEs were changed on that evidence and have been changed back.
 
-    The speed written while off has to be a different speed from the one the unit is
-    already at, which the first version of this check got wrong. It wrote the top speed
-    to a unit already sitting at the top speed, so the read-back was the same number
-    whether the write landed or was thrown away, and the check reported "settings do
-    stick after all" on evidence that could not distinguish the two.
+    So the claim here is the way round it always was, on the older evidence that a probe
+    hours before the first live run found every speed written while off reverting to the
+    slowest. Whether the timer explains that observation too is exactly what a run that
+    waits past it will say.
+
+    The speed written while off has to differ from the speed the unit is reporting by
+    then, which is why it is chosen after the first reading rather than before it. An
+    earlier version wrote the top speed to a unit sitting at the top speed, so the
+    read-back was the same number whether the write landed or was thrown away — and
+    picking the slowest speed instead would have had the same problem the other way up
+    against a unit that parks.
 
     Read from a `cmd:3` reply for the same reason the feature walk is: these are values
     the library sent and the device did not mention, so merged state would answer with
@@ -721,27 +749,45 @@ async def the_off_state_keeps_the_fan_speed_it_was_given(ctx: Context) -> None:
             f"the model offers only speed {top}, so a speed written while off "
             f"cannot be told apart from the one already set"
         )
+    window = min(POWER_DOWN, ctx.soak_seconds)
     was_power = ctx.state.power
     await ctx.command(ctx.device.async_set_fan_speed(top))
     await ctx.command(ctx.device.async_set_power(on=False))
+    parking = await ctx.until(lambda: ctx.state.fan_speed != top, timeout=window)
     parked = (await ctx.confirmed()).fan_speed
-    ctx.note(fan_speed_while_off=parked)
+    ctx.note(
+        fan_speed_while_off=parked,
+        seconds_to_park=parking and round(parking, 1),
+        power_down_window=round(window, 1),
+    )
+    # Chosen against what the unit reports now rather than against a speed picked in
+    # advance: whichever way the parking question came out, the speed written next has
+    # to be one the unit is not already sitting at, or the read-back is the same number
+    # whether the write landed or was thrown away.
+    target = other if parked != other else top
     try:
-        await ctx.command(ctx.device.async_set_fan_speed(other))
+        await ctx.command(ctx.device.async_set_fan_speed(target))
+        reverting = await ctx.until(
+            lambda: ctx.state.fan_speed != target, timeout=window
+        )
         kept = (await ctx.confirmed()).fan_speed
-        ctx.note(fan_speed_written_while_off=other, fan_speed_read_back_while_off=kept)
-        ctx.expect_but_continue(
-            parked == top,
-            f"the unit was powered down at speed {top} and reports {parked}; it "
-            f"parks the fan, so both READMEs are wrong to tell users that a speed "
-            f"shown while off is whatever it was last set to",
+        ctx.note(
+            fan_speed_written_while_off=target,
+            fan_speed_read_back_while_off=kept,
+            seconds_to_revert=reverting and round(reverting, 1),
         )
         ctx.expect_but_continue(
-            kept == other,
-            f"speed {other} was written to a unit that is off and it reads back "
-            f"{kept}; the write was discarded, so _restore has to keep sending "
-            f"settings before power and that ordering is a requirement, not a "
-            f"precaution",
+            parked != top,
+            f"the unit was powered down at speed {top} and still reports {parked} "
+            f"{window:.0f}s later, past its turn-off timer; it does not park the fan, "
+            f"so both READMEs are wrong to tell users that a speed shown while off is "
+            f"the parked one",
+        )
+        ctx.expect_but_continue(
+            kept != target,
+            f"speed {target} was written to a unit that is off and it still reads "
+            f"{kept} {window:.0f}s later; settings written while off do stick, so "
+            f"_restore is ordering its frames for no reason",
         )
     finally:
         if was_power:
