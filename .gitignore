@@ -10,3 +10,10 @@ dist/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Selftest and diagnostic reports. These are runs against somebody's own hardware and
+# account: the device block is redacted, but they are nobody else's business and one of
+# them reached this repo carrying a serial and a wifi SSID through an unredacted trace.
+selftest-*.json
+zafro-report*.json
+.env

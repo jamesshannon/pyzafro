@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from .capabilities import BinarySensorKey, Feature, SensorKey
-from .const import RESYNC_DELAY
+from .const import REDACTED, REDACTED_KEYS, RESYNC_DELAY
 from .exceptions import ZafroUnsupportedError
 from .models import (
     FIELD_TO_WIRE,
@@ -126,6 +126,19 @@ REACH_WAIT = 60.0
 #: interrupted run loses the least and the room is left cold for the shortest time. It
 #: no longer waits on physics — nothing here does — but it still makes physics happen.
 SUITES: tuple[str, ...] = ("fan", "protocol", "capabilities", "liveness", "thermal")
+
+
+def _redacted(frame: dict[str, Any]) -> dict[str, Any]:
+    """Return a frame with anything identifying the owner replaced, not removed.
+
+    Replaced rather than dropped so that a reader can tell "this was taken out" from
+    "the device never sent it" — a trace is evidence, and a silently shorter frame is
+    a misleading one.
+    """
+    return {
+        key: (REDACTED if key in REDACTED_KEYS else value)
+        for key, value in frame.items()
+    }
 
 
 class CheckFailedError(Exception):
@@ -1991,11 +2004,18 @@ class SelfTest:
         started = time.monotonic()
 
         def record(cmd: int, result: dict[str, Any]) -> None:
+            # Redacted here, where the frame enters the trace, rather than where the
+            # trace is written out. A trace is published — `-o` writes it for attaching
+            # to an issue — and the `cmd:5` reply carries the serial and the household
+            # wifi SSID. Emitting it redacted its own fields and copied these verbatim
+            # beside them, which is the failure mode a guard at the consumer invites.
+            # Nothing downstream has to remember, and nothing that reads a trace later
+            # can reintroduce it.
             frames.append(
                 {
                     "at": round(time.monotonic() - started, 2),
                     "cmd": cmd,
-                    "result": result,
+                    "result": _redacted(result),
                 }
             )
 

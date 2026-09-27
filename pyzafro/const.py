@@ -17,6 +17,20 @@ WS_PATH: Final = "/ws/iot1/"
 #: not validate it. It is a constant, not a parameter.
 LOGIN_COUNTRY: Final = "US"
 
+#: Wire and device-list keys that identify the owner or their home rather than the
+#: product, and must never appear in anything published — a bug report, a diagnostics
+#: download, a selftest report. One set, used by every path that emits, because two
+#: copies of a redaction list is one copy that falls behind: `sn` and `ssid` reached a
+#: committed report through a code path that redacted the fields it knew about and
+#: copied raw frames verbatim beside them.
+REDACTED_KEYS: Final = frozenset(
+    {"sn", "mac", "ssid", "name", "room", "additional", "data"}
+)
+
+#: What a redacted value is replaced with, so a reader can tell a removed field from a
+#: field the device never sent. Dropping it silently makes the report look complete.
+REDACTED: Final = "<redacted>"
+
 # --- REST envelope -----------------------------------------------------------------
 #: Body-level success code. Independent of the HTTP status.
 OK_CODE: Final = 0

@@ -16,7 +16,9 @@ from typing import Any
 import pytest
 
 from pyzafro.capabilities import Feature, resolve
+from pyzafro.const import REDACTED
 from pyzafro.device import ZafroDevice
+from pyzafro.diagnose import _emit_selftest
 from pyzafro.models import Mode
 from pyzafro.selftest import (
     CHECKS,
@@ -31,8 +33,14 @@ from pyzafro.selftest import (
     summarise,
 )
 
+#: Stand-ins for the two things a real `cmd:5` reply carries that identify the owner
+#: rather than the product. Distinctive on purpose, so a test can assert they appear
+#: nowhere in anything this tool writes out.
+_FAKE_SERIAL = "6ISEComboWF020BSJ0000000000"
+_FAKE_SSID = "a-households-wifi-name"
+
 RAW = {
-    "sn": "6ISEComboWF020BSJ0000000000",
+    "sn": _FAKE_SERIAL,
     "vendor": "I4SEASON",
     "model": "90038EAC0-12K-ZAZ",
     "name": "Test AC",
@@ -249,8 +257,24 @@ class FakeUnit:
             self._recompute()
             return [(3, self._stamp(dict(self.wire), 0))]
         if cmd == 5:
+            # Every key the real reply carries, including the two that identify the
+            # owner rather than the product. The fake used to omit them, which is why
+            # nothing noticed them reaching a published trace verbatim: a fake more
+            # discreet than the hardware tests the wrong device.
             return [
-                (5, {"v": "I4SEASON", "p": self.model, "ver": "1.0.29", "rssi": 44})
+                (
+                    5,
+                    {
+                        "v": "I4SEASON",
+                        "p": self.model,
+                        "ver": "1.0.29",
+                        "mcu_ver": "1.0.01",
+                        "mp": "SC95F8613B-3/US",
+                        "rssi": 44,
+                        "sn": _FAKE_SERIAL,
+                        "ssid": _FAKE_SSID,
+                    },
+                )
             ]
 
         asked = {
@@ -612,6 +636,52 @@ async def test_a_unit_that_holds_speed_zero_says_so():
     held = _one(results, "the_sleep_speed_is_refused_by_the_device")
     assert held.outcome == "fail"
     assert "belongs in fan_speeds" in held.detail
+
+
+# --- nothing published identifies whoever ran it -------------------------------------
+
+
+async def test_no_frame_in_any_trace_carries_the_serial_or_the_wifi_name(tmp_path):
+    """The whole report, written the way `-o` writes it, and scanned as text.
+
+    `cmd:5` carries the device serial and the household wifi SSID. A trace is
+    *published* — the flag exists so a report can be attached to an issue — and the
+    emitter redacted the fields it knew about while copying raw frames verbatim beside
+    them, so both reached a report that its own docstring called redacted.
+
+    Scanned as a string rather than field by field, because the point is that nothing
+    anywhere in it carries these, however the structure changes later. A field-by-field
+    assertion is a list of the places somebody already thought of.
+    """
+    runner, results = await _run(FakeUnit())
+    out = tmp_path / "report.json"
+    _emit_selftest(runner.device, runner, results, str(out))
+    written = out.read_text()
+
+    assert _FAKE_SERIAL not in written
+    assert _FAKE_SSID not in written
+    # The frames are still there, and still say what was taken out of them.
+    assert '"cmd": 5' in written
+    assert REDACTED in written
+
+
+async def test_a_redacted_frame_says_so_rather_than_going_quiet():
+    """A removed key has to leave a mark, because a trace is evidence.
+
+    Dropping it silently gives a frame that looks like the whole frame and reads as if
+    the device never sent the field, which is a different and wrong conclusion.
+    """
+    _, results = await _run(FakeUnit())
+    base_info = [
+        frame for result in results for frame in result.trace if frame["cmd"] == 5
+    ]
+    assert base_info, "no cmd:5 frame was traced, so this asserts nothing"
+    for frame in base_info:
+        assert frame["result"]["sn"] == REDACTED
+        assert frame["result"]["ssid"] == REDACTED
+        # Everything that describes the product rather than its owner survives.
+        assert frame["result"]["v"] == "I4SEASON"
+        assert frame["result"]["rssi"] == 44
 
 
 # --- skipping, rather than failing, when a model cannot answer -----------------------

@@ -552,7 +552,12 @@ def _emit_selftest(
     results: list[CheckResult],
     out: str,
 ) -> None:
-    """Write the run as JSON, redacted the same way a report is."""
+    """Write the run as JSON, redacted the same way a report is.
+
+    Both halves are redacted at their source: `device.diagnostics()` for the device
+    block, and the trace recorder for every frame. This function is deliberately not
+    the place that does it — a report written by anything else has to be safe too.
+    """
     payload = {
         "pyzafro_version": __version__,
         "device": device.diagnostics(),

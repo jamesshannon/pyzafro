@@ -24,6 +24,7 @@ from .const import (
     CMD_STATE_PUSH,
     PROBE_ATTEMPTS,
     PROBE_INTERVAL,
+    REDACTED_KEYS,
     REQUEST_TIMEOUT,
     RESYNC_DELAY,
     UNANSWERED_GRACE,
@@ -814,12 +815,11 @@ class ZafroDevice:
         """Return a redacted dump, for bug reports about unsupported models.
 
         Removes the serial, MAC, and every user-chosen name — device names and room
-        names are often personal.
+        names are often personal. The key set is `REDACTED_KEYS`, shared with every
+        other path that emits, so that this list and another cannot drift apart.
         """
         redacted = {
-            key: value
-            for key, value in self._raw.items()
-            if key not in {"sn", "mac", "name", "room", "additional", "data"}
+            key: value for key, value in self._raw.items() if key not in REDACTED_KEYS
         }
         return {
             "anon_id": self.anon_id,
